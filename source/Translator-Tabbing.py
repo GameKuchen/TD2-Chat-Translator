@@ -26,7 +26,7 @@ config = configparser.ConfigParser()
 config.read(resource_path('config.cfg'))
 openai.api_key = config['DEFAULT']['OPENAI_API_KEY']
 deepl_api_key = config['DEFAULT']['deepl_api_key']
-current_version = "0.1.9"
+current_version = "0.2.0"
 
 def load_ignore_list(filepath):
     with open(filepath, 'r', encoding='utf-8') as file:
@@ -326,7 +326,7 @@ class App:
         text_area.tag_config('translated', foreground='orange', font=("Helvetica", 10, "bold"))
         text_area.tag_config('swdr', foreground='green', font=("Helvetica", 10, "bold"))
         # Original Tag noch ohne Farbe setzen, wird in apply_theme() aktualisiert
-        text_area.tag_config('original', font=("Helvetica", 10, "bold"))
+        text_area.tag_config('original', foreground='black',font=("Helvetica", 10, "bold"))
 
         queue = Queue()
         stop_event = Event()
