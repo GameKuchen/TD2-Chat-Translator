@@ -26,7 +26,7 @@ config = configparser.ConfigParser()
 config.read(resource_path('config.cfg'))
 openai.api_key = config['DEFAULT']['OPENAI_API_KEY']
 deepl_api_key = config['DEFAULT']['deepl_api_key']
-current_version = "0.2.0"
+current_version = "0.2.1"
 
 def load_ignore_list(filepath):
     with open(filepath, 'r', encoding='utf-8') as file:
@@ -237,6 +237,7 @@ class App:
         self.opened_logs = set()
         self.latest_log_time = None
         self.directory_path = ""
+        self.known_logs = {} # Speichert log_file_path -> letzte bekannte mtime
 
         self.create_widgets()
         self.check_for_updates()
@@ -303,7 +304,19 @@ class App:
                 self.open_log_in_new_tab(newest)
                 self.latest_log_time = os.path.getctime(newest)
 
+            # Alle Logs merken (mtime)
+            self.record_all_logs()
+
             self.monitor_new_logs()
+
+    def record_all_logs(self):
+        # Speichere mtime aller Logs, damit wir Veränderungen feststellen können
+        if not self.directory_path:
+            return
+        log_files = [os.path.join(self.directory_path, f) for f in os.listdir(self.directory_path)
+                     if os.path.isfile(os.path.join(self.directory_path, f)) and "Log" in f]
+        for lf in log_files:
+            self.known_logs[lf] = os.path.getmtime(lf)
 
     def find_newest_log_file(self, directory_path):
         log_files = [os.path.join(directory_path, f) for f in os.listdir(directory_path)
@@ -325,8 +338,8 @@ class App:
         text_area.tag_config('fahrdienstleiter', foreground='#DF7676', font=("Helvetica", 10, "bold"))
         text_area.tag_config('translated', foreground='orange', font=("Helvetica", 10, "bold"))
         text_area.tag_config('swdr', foreground='green', font=("Helvetica", 10, "bold"))
-        # Original Tag noch ohne Farbe setzen, wird in apply_theme() aktualisiert
-        text_area.tag_config('original', foreground='black',font=("Helvetica", 10, "bold"))
+        text_area.tag_config('original', font=("Helvetica", 10, "bold"))
+        self.apply_theme()
 
         queue = Queue()
         stop_event = Event()
@@ -360,18 +373,25 @@ class App:
         t.start()
 
         self.handlers.append((handler, queue, stop_event, text_area, tab_id))
-
-        # Nach Erstellen des Tabs die Farben für original anpassen:
         self.apply_original_tag_colors()
 
     def monitor_new_logs(self):
         if self.directory_path:
-            newest = self.find_newest_log_file(self.directory_path)
-            if newest:
-                ctime = os.path.getctime(newest)
-                if self.latest_log_time is not None and ctime > self.latest_log_time:
-                    self.open_log_in_new_tab(newest)
-                    self.latest_log_time = ctime
+            # Prüfe alle Logs erneut
+            log_files = [os.path.join(self.directory_path, f) for f in os.listdir(self.directory_path)
+                         if os.path.isfile(os.path.join(self.directory_path, f)) and "Log" in f]
+            for lf in log_files:
+                mtime = os.path.getmtime(lf)
+                if lf not in self.opened_logs:
+                    # Kann dieses ältere Log aktiv sein?
+                    # Wir vergleichen mtime mit previously known mtime
+                    old_mtime = self.known_logs.get(lf, None)
+                    if old_mtime is not None and mtime > old_mtime:
+                        # Log hat sich geändert, also aktiv geworden
+                        self.open_log_in_new_tab(lf)
+                # Aktualisiere known_logs mit neuem mtime
+                self.known_logs[lf] = mtime
+
         self.root.after(10000, self.monitor_new_logs)
 
     def apply_theme(self):
@@ -405,12 +425,10 @@ class App:
             self.service_combobox.configure(style="Light.TCombobox")
 
         self._update_widget_theme(self.root, bg_color, fg_color, text_area_bg, text_area_fg, button_bg, button_fg)
-
-        # Nach aktualisierung des Themes die Farben für den original-Tag anpassen
         self.apply_original_tag_colors()
 
     def apply_original_tag_colors(self):
-        # Original-Tag-Farbe je nach Dark-Mode ändern
+        # Original-Tag-Farbe je nach Dark-Mode
         original_fg = "#FFFFFF" if self.is_dark_mode.get() else "#000000"
         for handler, queue, stop_event, text_area, tab_id in self.handlers:
             text_area.tag_config("original", foreground=original_fg)
