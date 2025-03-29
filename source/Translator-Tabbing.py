@@ -16,6 +16,8 @@ from googletrans import Translator
 import csv
 from tkinter import ttk
 import time
+from concurrent.futures import ThreadPoolExecutor
+
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev und for PyInstaller """
@@ -26,7 +28,7 @@ config = configparser.ConfigParser()
 config.read(resource_path('config.cfg'))
 openai.api_key = config['DEFAULT']['OPENAI_API_KEY']
 deepl_api_key = config['DEFAULT']['deepl_api_key']
-current_version = "0.2.1"
+current_version = "0.2.2"
 
 def load_ignore_list(filepath):
     with open(filepath, 'r', encoding='utf-8') as file:
@@ -91,38 +93,53 @@ class LogHandler:
         if not self.stop_event.is_set():
             self.text_widget.after(5000, self.check_new_lines)
 
+
     def translate_lines(self, lines):
         translated_lines = []
-        for line in lines:
-            match_fd = re.search(r'^(.*?)\((\d{2}:\d{2}:\d{2})\) ([A-Za-z].*?@[^: ]+)(: | )(.*)$', line)
-            match_player = re.search(r'^(.*?)\((\d{2}:\d{2}:\d{2})\) (\d+@[^: ]+)(: | )(.*)$', line)
-            match_swdr = re.search(r'^(.*?)\((\d{2}:\d{2}:\d{2})\) \[(.*? \((.*?)\))\] (.*)$', line)
+        tasks = []
+        
+        with ThreadPoolExecutor(max_workers=3) as executor:  # Bis zu 3 Übersetzungen parallel
+            future_to_line = {}
 
-            if match_fd:
-                timestamp_user, message = match_fd.group(1) + "(" + match_fd.group(2) + ") " + match_fd.group(3), match_fd.group(5).strip()
-                tag = "fahrdienstleiter"
-            elif match_player:
-                timestamp_user, message = match_player.group(1) + "(" + match_player.group(2) + ") " + match_player.group(3), match_player.group(5).strip()
-                tag = "translated"
-            elif match_swdr:
-                timestamp_user, message = match_swdr.group(1) + "(" + match_swdr.group(2) + ") [" + match_swdr.group(3) + "]", match_swdr.group(5).strip()
-                tag = "swdr"
-            else:
-                continue
+            for line in lines:
+                match_fd = re.search(r'^(.*?)\((\d{2}:\d{2}:\d{2})\) ([A-Za-z].*?@[^: ]+)(: | )(.*)$', line)
+                match_player = re.search(r'^(.*?)\((\d{2}:\d{2}:\d{2})\) (\d+@[^: ]+)(: | )(.*)$', line)
+                match_swdr = re.search(r'^(.*?)\((\d{2}:\d{2}:\d{2})\) \[(.*? \((.*?)\))\] (.*)$', line)
 
-            if message in self.ignore_list:
-                continue
+                if match_fd:
+                    timestamp_user, message = match_fd.group(1) + "(" + match_fd.group(2) + ") " + match_fd.group(3), match_fd.group(5).strip()
+                    tag = "fahrdienstleiter"
+                elif match_player:
+                    timestamp_user, message = match_player.group(1) + "(" + match_player.group(2) + ") " + match_player.group(3), match_player.group(5).strip()
+                    tag = "translated"
+                elif match_swdr:
+                    timestamp_user, message = match_swdr.group(1) + "(" + match_swdr.group(2) + ") [" + match_swdr.group(3) + "]", match_swdr.group(5).strip()
+                    tag = "swdr"
+                else:
+                    continue
 
-            current_target_language = self.language_var.get()
-            translation_service = self.service_var.get()
-            self.target_language = current_target_language
+                if message in self.ignore_list:
+                    continue
 
-            translation = self.translate_message(message, translation_service)
-            translation = re.sub(r'【[^】]*】', '', translation).strip()
+                current_target_language = self.language_var.get()
+                translation_service = self.service_var.get()
+                self.target_language = current_target_language
 
-            if self.show_original.get():
-                translated_lines.append((f"Original: {timestamp_user}: {message}", "original"))
-            translated_lines.append((f"Translated: {timestamp_user}: {translation}", tag))
+                # Starte die Übersetzung parallel
+                future = executor.submit(self.translate_message, message, translation_service)
+                future_to_line[future] = (timestamp_user, message, tag)
+
+            # Ergebnisse einsammeln, sobald sie fertig sind
+            for future in future_to_line:
+                timestamp_user, message, tag = future_to_line[future]
+                translation = future.result()  # Wartet auf die Übersetzung
+
+                translation = re.sub(r'【[^】]*】', '', translation).strip()
+
+                if self.show_original.get():
+                    translated_lines.append((f"Original: {timestamp_user}: {message}", "original"))
+                translated_lines.append((f"Translated: {timestamp_user}: {translation}", tag))
+
         return translated_lines
 
     def translate_message(self, text, translation_service):
