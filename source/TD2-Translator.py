@@ -28,7 +28,7 @@ config = configparser.ConfigParser()
 config.read(resource_path('config.cfg'))
 openai.api_key = config['DEFAULT']['OPENAI_API_KEY']
 deepl_api_key = config['DEFAULT']['deepl_api_key']
-current_version = "0.2.3"
+current_version = "0.2.7"
 
 def load_ignore_list(filepath):
     with open(filepath, 'r', encoding='utf-8') as file:
@@ -102,7 +102,7 @@ class LogHandler:
             future_to_line = {}
 
             for line in lines:
-                match_fd = re.search(r'^(.*?)\((\d{2}:\d{2}:\d{2})\) ([A-Za-z].*?@[^: ]+)(: | )(.*)$', line)
+                match_fd = re.search(r'^(.*?)\((\d{2}:\d{2}:\d{2})\) ([A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż].*?@[^: ]+)(: | )(.*)$', line)
                 match_player = re.search(r'^(.*?)\((\d{2}:\d{2}:\d{2})\) (\d+@[^: ]+)(: | )(.*)$', line)
                 match_swdr = re.search(r'^(.*?)\((\d{2}:\d{2}:\d{2})\) \[(.*? \((.*?)\))\] (.*)$', line)
 
@@ -162,7 +162,7 @@ class LogHandler:
 
             run = client.beta.threads.runs.create_and_poll(
                 thread_id=thread.id,
-                assistant_id="asst_VQVZRc35HMmcZO7P00VaUeRg",
+                assistant_id="asst_dxWUY2bN5TSwZXi09Q7HKITj",
                 instructions="You are a translator. Translate the text provided to you to the requested languages without any additional explanations. The Source can be in multiple languages. Refer to the uploaded translations PDF first for predefined translations. Only reply with the requested target language."
             )
 
