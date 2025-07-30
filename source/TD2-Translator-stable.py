@@ -17,26 +17,6 @@ import csv
 from tkinter import ttk
 import time
 from concurrent.futures import ThreadPoolExecutor
-if sys.platform == "win32":
-    try:
-        from ctypes import windll, POINTER, byref
-        from ctypes.wintypes import HWND, UINT, RECT
-
-        # DPI-Aware setzen
-        windll.shcore.SetProcessDpiAwareness(2)
-
-        # DPI des Hauptmonitors holen
-        hdc = windll.user32.GetDC(0)
-        dpi = windll.gdi32.GetDeviceCaps(hdc, 88)  # 88 = LOGPIXELSX
-        windll.user32.ReleaseDC(0, hdc)
-
-        # Tkinter-Skalierung setzen (96 DPI = scaling 1.0)
-        scaling = dpi / 96
-        _dpi_scaling = scaling
-    except Exception:
-        _dpi_scaling = 1.0
-else:
-    _dpi_scaling = 1.0
 
 
 def resource_path(relative_path):
@@ -257,8 +237,6 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title("Train Driver 2 Translation Helper")
-        self.overlay_window = None  # Overlay Referenz
-        self.overlay_font_size = 10  # Startwert für Overlay-Textgröße
 
         icon_path = resource_path(os.path.join('res', 'Favicon.ico'))
         if os.path.exists(icon_path):
@@ -289,7 +267,6 @@ class App:
 
         top_frame = tk.Frame(main_frame)
         top_frame.pack(side=tk.TOP, fill=tk.X)
-        
 
         img_path = resource_path(os.path.join('res', 'image.png'))
         if os.path.exists(img_path):
@@ -323,14 +300,11 @@ class App:
         self.service_combobox = ttk.Combobox(frame2, textvariable=self.service_var, state="readonly", values=service_values)
         self.service_combobox.pack(side=tk.LEFT, padx=5)
 
+        tk.Checkbutton(frame2, text="Dark Mode", variable=self.is_dark_mode, command=self.apply_theme).pack(side=tk.LEFT, padx=5)
+
         frame3 = tk.Frame(main_frame)
         frame3.pack(pady=5, fill=tk.X)
         tk.Button(frame3, text="Close Selected Tab", command=self.close_selected_tab).pack(side=tk.LEFT, padx=5)
-        tk.Button(frame3, text="Toggle Overlay", command=self.toggle_overlay).pack(side=tk.LEFT, padx=5)
-        tk.Button(frame3, text="A+", command=lambda: self.change_overlay_font_size(1)).pack(side=tk.LEFT, padx=5)
-        tk.Button(frame3, text="A−", command=lambda: self.change_overlay_font_size(-1)).pack(side=tk.LEFT, padx=5)
-
-        tk.Checkbutton(frame3, text="Dark Mode", variable=self.is_dark_mode, command=self.apply_theme).pack(side=tk.LEFT, padx=5)
 
         self.notebook = ttk.Notebook(main_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True, pady=10)
@@ -536,102 +510,9 @@ class App:
             if handler.file:
                 handler.file.close()
         self.root.destroy()
-    def toggle_overlay(self):
-        if self.overlay_window and self.overlay_window.winfo_exists():
-            self.overlay_window.destroy()
-            self.overlay_window = None
-        else:
-            self.overlay_window = tk.Toplevel(self.root)
-            self.overlay_window.title("Overlay")
-            self.overlay_window.overrideredirect(True)
-            self.overlay_window.resizable(True, True) 
-            self.overlay_window.attributes('-topmost', True)
-            self.overlay_window.geometry("400x200+100+100")
-            self.overlay_window.attributes("-alpha", 0.95)
-            self.overlay_window.configure(bg="#000000" if self.is_dark_mode.get() else "#FFFFFF")
-
-            self.overlay_text = tk.Text(self.overlay_window, wrap=tk.WORD, height=20, width=50,
-                                        bg="#3E3E3E" if self.is_dark_mode.get() else "#FFFFFF",
-                                        fg="#FFFFFF" if self.is_dark_mode.get() else "#000000",
-                                        font=("Helvetica", self.overlay_font_size, "bold"),
-                                        borderwidth=0)
-            self.overlay_text.pack(fill=tk.BOTH, expand=True)
-            self.overlay_text.tag_config('fahrdienstleiter', foreground='#DF7676')
-            self.overlay_text.tag_config('translated', foreground='orange')
-            self.overlay_text.tag_config('swdr', foreground='green')
-            self.overlay_text.tag_config('original', foreground='#FFFFFF' if self.is_dark_mode.get() else '#000000')
-
-
-            self.make_overlay_draggable()
-            if self.handlers:
-                handler, queue, stop_event, main_text_area, tab_id = self.handlers[-1]
-                self.start_overlay_sync(main_text_area)
-            sizegrip = ttk.Sizegrip(self.overlay_window)
-            sizegrip.place(relx=1.0, rely=1.0, anchor="se")
-
-    def start_overlay_sync(self, source_text_widget):
-        def sync():
-            if not self.overlay_window or not self.overlay_window.winfo_exists():
-                return
-
-            self.overlay_text.config(state="normal")
-            self.overlay_text.delete("1.0", tk.END)
-
-            # Ganzen Text kopieren
-            full_text = source_text_widget.get("1.0", tk.END)
-            self.overlay_text.insert("1.0", full_text)
-
-            # Alle Tags im Quell-Widget durchgehen
-            for tag in source_text_widget.tag_names():
-                tag_ranges = source_text_widget.tag_ranges(tag)
-                for i in range(0, len(tag_ranges), 2):
-                    start = tag_ranges[i]
-                    end = tag_ranges[i+1]
-                    self.overlay_text.tag_add(tag, start, end)
-
-            self.overlay_text.config(state="disabled")
-            self.overlay_text.see(tk.END)
-            self.root.after(1000, sync)
-        sync()
-
-
-
-    def make_overlay_draggable(self):
-        def start_move(event):
-            self._x = event.x
-            self._y = event.y
-
-        def do_move(event):
-            deltax = event.x - self._x
-            deltay = event.y - self._y
-            x = self.overlay_window.winfo_x() + deltax
-            y = self.overlay_window.winfo_y() + deltay
-            self.overlay_window.geometry(f"+{x}+{y}")
-
-        self.overlay_window.bind("<ButtonPress-1>", start_move)
-        self.overlay_window.bind("<B1-Motion>", do_move)
-
-    def on_closing(self):
-        for handler, queue, stop_event, text_area, tab_id in self.handlers:
-            stop_event.set()
-            if handler.file:
-                handler.file.close()
-        if self.overlay_window and self.overlay_window.winfo_exists():
-            self.overlay_window.destroy()
-        self.root.destroy()
-    def change_overlay_font_size(self, delta):
-        if not self.overlay_window or not self.overlay_window.winfo_exists():
-            return
-        self.overlay_font_size = max(6, self.overlay_font_size + delta)
-        self.overlay_text.configure(font=("Helvetica", self.overlay_font_size, "bold"))
-
 
 if __name__ == "__main__":
     root = tk.Tk()
-
-    # DPI-Skalierung für Tk setzen
-    root.tk.call('tk', 'scaling', _dpi_scaling)
-
     app = App(root)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()
