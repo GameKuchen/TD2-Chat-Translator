@@ -567,7 +567,6 @@ class App(QtWidgets.QMainWindow):
 
     def process_lines(self, handler, text_area, lines):
         translated_lines = handler.translate_lines(lines)
-
         for line, line_type in translated_lines:
             cursor = text_area.textCursor()
             cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
@@ -582,8 +581,10 @@ class App(QtWidgets.QMainWindow):
                 fmt.setForeground(QtGui.QColor("green"))
                 fmt.setFontWeight(QtGui.QFont.Weight.Bold)
             elif line_type == "original":
-                fmt.setFontWeight(QtGui.QFont.Weight.Bold)
-                fmt.setForeground(QtGui.QColor("#FFFFFF" if self.is_dark_mode else "#000000"))
+                # Diese Zeile ist überflüssig, da "original" nie erzeugt wird
+                # fmt.setFontWeight(QtGui.QFont.Weight.Bold)
+                # fmt.setForeground(QtGui.QColor("#FFFFFF" if self.is_dark_mode else "#000000"))
+                pass
             cursor.insertText(line + "\n", fmt)
             text_area.setTextCursor(cursor)
             text_area.ensureCursorVisible()
