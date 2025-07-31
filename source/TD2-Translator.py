@@ -1,43 +1,24 @@
+from email.mime import text
 import os
 import sys
 import re
-import tkinter as tk
-from tkinter import filedialog, messagebox
+from PyQt6 import QtWidgets, QtGui, QtCore
 import openai
 import deepl
 import requests
 import configparser
 from queue import Queue
 from threading import Thread, Event
-from PIL import Image, ImageTk
+from PIL import Image, ImageQt
 import httpcore
 setattr(httpcore, 'SyncHTTPTransport', 'AsyncHTTPProxy')
 from googletrans import Translator
 import csv
-from tkinter import ttk
 import time
+from packaging import version
 from concurrent.futures import ThreadPoolExecutor
-if sys.platform == "win32":
-    try:
-        from ctypes import windll, POINTER, byref
-        from ctypes.wintypes import HWND, UINT, RECT
-
-        # DPI-Aware setzen
-        windll.shcore.SetProcessDpiAwareness(2)
-
-        # DPI des Hauptmonitors holen
-        hdc = windll.user32.GetDC(0)
-        dpi = windll.gdi32.GetDeviceCaps(hdc, 88)  # 88 = LOGPIXELSX
-        windll.user32.ReleaseDC(0, hdc)
-
-        # Tkinter-Skalierung setzen (96 DPI = scaling 1.0)
-        scaling = dpi / 96
-        _dpi_scaling = scaling
-    except Exception:
-        _dpi_scaling = 1.0
-else:
-    _dpi_scaling = 1.0
-
+import json
+current_version = "0.2.7"
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev und for PyInstaller """
@@ -48,7 +29,6 @@ config = configparser.ConfigParser()
 config.read(resource_path('config.cfg'))
 openai.api_key = config['DEFAULT']['OPENAI_API_KEY']
 deepl_api_key = config['DEFAULT']['deepl_api_key']
-current_version = "0.2.8"
 
 def load_ignore_list(filepath):
     with open(filepath, 'r', encoding='utf-8') as file:
@@ -59,29 +39,36 @@ def load_fixed_translations(filepath):
     with open(filepath, 'r', encoding='utf-8') as file:
         reader = csv.DictReader(file)
         for row in reader:
-            text = row['text']
-            language = row['language']
-            translation = row['translation']
+            text = row['text'].strip().lower()  # Kleinbuchstaben fürs Matching
+            language = row['language'].strip()
+            translation = row['translation'].strip()
             if text not in fixed_translations:
                 fixed_translations[text] = {}
             fixed_translations[text][language] = translation
     return fixed_translations
 
-class LogHandler:
-    def __init__(self, log_file_path, text_widget, language_var, service_var, queue, stop_event, show_original, ignore_list, fixed_translations):
+def load_scenery_names(filepath):
+    with open(filepath, 'r', encoding='utf-8') as file:
+        # Alle Namen als Set, ohne Leerzeichen am Anfang/Ende
+        return {line.strip() for line in file if line.strip()}
+
+class LogHandler(QtCore.QObject):
+    lines_translated = QtCore.pyqtSignal(list)
+
+    # Entferne 'show_original' aus der __init__-Signatur
+    def __init__(self, log_file_path, language_var, service_var, ignore_list, fixed_translations, scenery_names):
+        super().__init__()
         self.log_file_path = log_file_path
         self.file = open(log_file_path, 'r', encoding='utf-8')
-        self.text_widget = text_widget
         self.language_var = language_var
         self.service_var = service_var
-        self.queue = queue
-        self.stop_event = stop_event
-        self.show_original = show_original
         self.ignore_list = ignore_list
         self.fixed_translations = fixed_translations
+        self.scenery_names = scenery_names
         self.translator = Translator()
         self.deepl_translator = deepl.Translator(deepl_api_key)
         self.last_position = self.file.tell()
+        self.stop_event = Event()
 
     @staticmethod
     def contains_time(line):
@@ -97,35 +84,30 @@ class LogHandler:
     def check_new_lines(self):
         if self.stop_event.is_set() or not self.file:
             return
-
         self.file.seek(self.last_position)
         lines = []
-        while (line := self.file.readline()):
+        while True:
+            line = self.file.readline()
+            if not line:
+                break
             if "ChatMessage:" in line and self.contains_time(line):
                 clean_line = self.clean_chat_message(line)
                 if clean_line:
                     lines.append(clean_line)
-
         if lines:
             self.last_position = self.file.tell()
-            self.queue.put(lines)
-
-        if not self.stop_event.is_set():
-            self.text_widget.after(5000, self.check_new_lines)
-
+            self.lines_translated.emit(lines)
 
     def translate_lines(self, lines):
         translated_lines = []
-        tasks = []
-        
-        with ThreadPoolExecutor(max_workers=3) as executor:  # Bis zu 3 Übersetzungen parallel
+        # Begrenze die Anzahl paralleler Threads für Google Translate auf 1, um Hänger zu vermeiden
+        max_workers = 1 if (self.service_var() if callable(self.service_var) else self.service_var) == "Google Translate" else 3
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_line = {}
-
             for line in lines:
                 match_fd = re.search(r'^(.*?)\((\d{2}:\d{2}:\d{2})\) ([A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż].*?@[^: ]+)(: | )(.*)$', line)
                 match_player = re.search(r'^(.*?)\((\d{2}:\d{2}:\d{2})\) (\d+@[^: ]+)(: | )(.*)$', line)
                 match_swdr = re.search(r'^(.*?)\((\d{2}:\d{2}:\d{2})\) \[(.*? \((.*?)\))\] (.*)$', line)
-
                 if match_fd:
                     timestamp_user, message = match_fd.group(1) + "(" + match_fd.group(2) + ") " + match_fd.group(3), match_fd.group(5).strip()
                     tag = "fahrdienstleiter"
@@ -137,38 +119,63 @@ class LogHandler:
                     tag = "swdr"
                 else:
                     continue
-
                 if message in self.ignore_list:
                     continue
-
-                current_target_language = self.language_var.get()
-                translation_service = self.service_var.get()
+                current_target_language = self.language_var() if callable(self.language_var) else self.language_var
+                translation_service = self.service_var() if callable(self.service_var) else self.service_var
                 self.target_language = current_target_language
 
-                # Starte die Übersetzung parallel
+                # Entferne show_original Logik
                 future = executor.submit(self.translate_message, message, translation_service)
-                future_to_line[future] = (timestamp_user, message, tag)
-
-            # Ergebnisse einsammeln, sobald sie fertig sind
+                future_to_line[future] = (timestamp_user, tag)
             for future in future_to_line:
-                timestamp_user, message, tag = future_to_line[future]
-                translation = future.result()  # Wartet auf die Übersetzung
-
+                timestamp_user, tag = future_to_line[future]
+                translation = future.result()
                 translation = re.sub(r'【[^】]*】', '', translation).strip()
-
-                if self.show_original.get():
-                    translated_lines.append((f"Original: {timestamp_user}: {message}", "original"))
-                translated_lines.append((f"Translated: {timestamp_user}: {translation}", tag))
-
+                translated_lines.append((f"{timestamp_user}: {translation}", tag))
         return translated_lines
 
     def translate_message(self, text, translation_service):
+        current_target_language = self.target_language
+        text_lower = text.lower()
+        # Prüfe zuerst auf fixed translations, egal welcher Service
+        if (
+            text_lower in self.fixed_translations  
+            and current_target_language in self.fixed_translations[text_lower]
+        ):
+            return self.fixed_translations[text_lower][current_target_language]
+
+        # Maskiere Szenerie-Namen vor Übersetzung
+        masked_text, mask_map = self._mask_scenery_names(text)
+
         if translation_service == "ChatGPT":
-            return self.translate_with_chatgpt(text)
+            translated = self.translate_with_chatgpt(masked_text)
         elif translation_service == "Google Translate":
-            return self.translate_with_google(text)
+            translated = self.translate_with_google(masked_text)
         elif translation_service == "Deepl":
-            return self.translate_with_deepl(text)
+            translated = self.translate_with_deepl(masked_text)
+        else:
+            translated = masked_text
+
+        # Entmaske die Szenerie-Namen wieder
+        return self._unmask_scenery_names(translated, mask_map)
+
+    def _mask_scenery_names(self, text):
+        mask_map = {}
+        masked_text = text
+        for name in sorted(self.scenery_names, key=len, reverse=True):
+            # Nur ganze Wörter ersetzen, case-insensitive
+            pattern = r'\b' + re.escape(name) + r'\b'
+            mask = f"__SCENERY_{hash(name)}__"
+            if re.search(pattern, masked_text):
+                masked_text = re.sub(pattern, mask, masked_text)
+                mask_map[mask] = name
+        return masked_text, mask_map
+
+    def _unmask_scenery_names(self, text, mask_map):
+        for mask, name in mask_map.items():
+            text = text.replace(mask, name)
+        return text
 
     def translate_with_chatgpt(self, text):
         try:
@@ -205,8 +212,18 @@ class LogHandler:
 
     def translate_with_google(self, text):
         try:
-            translation = self.translator.translate(text, dest=self.target_language)
-            return translation.text
+            result = self.translator.translate(text, dest=self.target_language)
+            # googletrans v4+ benötigt ein laufendes Event Loop für async, aber ThreadPoolExecutor-Worker haben keins.
+            # Lösung: Erzwinge die Nutzung eines eigenen Event Loops, falls nötig.
+            if hasattr(result, "__await__"):
+                import asyncio
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                result = loop.run_until_complete(result)
+            return result.text
         except Exception as e:
             return str(e)
 
@@ -252,104 +269,212 @@ class LogHandler:
         }
         return language_codes.get(language, None)
 
+class OverlayWindow(QtWidgets.QWidget):
+    SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".td2_overlay_settings.json")
 
-class App:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Train Driver 2 Translation Helper")
-        self.overlay_window = None  # Overlay Referenz
-        self.overlay_font_size = 10  # Startwert für Overlay-Textgröße
+    def __init__(self, parent=None, dark_mode=True, font_size=10):
+        super().__init__(parent)
+        # Rahmenlos und immer oben, aber auch resizable und dragbar
+        self.setWindowFlags(
+            QtCore.Qt.WindowType.FramelessWindowHint |
+            QtCore.Qt.WindowType.WindowStaysOnTopHint |
+            QtCore.Qt.WindowType.Window
+        )
+        self.setWindowOpacity(0.95)
+        self.resize(400, 200)
+        self.setMinimumSize(200, 100)
+        self.font_size = font_size
+        self.text_edit = QtWidgets.QTextEdit(self)
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setFont(QtGui.QFont("Helvetica", self.font_size, QtGui.QFont.Weight.Bold))
+        self.text_edit.setStyleSheet(
+            f"background-color: {'#3E3E3E' if dark_mode else '#FFFFFF'}; color: {'#FFFFFF' if dark_mode else '#000000'};"
+        )
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.text_edit)
+        self.setLayout(layout)
+        self._drag_pos = None
+
+        # Add a resize handle in the lower right corner
+        self.size_grip = QtWidgets.QSizeGrip(self)
+        layout.addWidget(self.size_grip, 0, QtCore.Qt.AlignmentFlag.AlignBottom | QtCore.Qt.AlignmentFlag.AlignRight)
+
+        self.load_overlay_settings()
+
+    def load_overlay_settings(self):
+        try:
+            if os.path.exists(self.SETTINGS_FILE):
+                with open(self.SETTINGS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    pos = data.get("pos")
+                    size = data.get("size")
+                    if pos:
+                        self.move(pos[0], pos[1])
+                    if size:
+                        self.resize(size[0], size[1])
+        except Exception:
+            pass
+
+    def save_overlay_settings(self):
+        try:
+            data = {
+                "pos": [self.x(), self.y()],
+                "size": [self.width(), self.height()]
+            }
+            with open(self.SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    def moveEvent(self, event):
+        self.save_overlay_settings()
+        super().moveEvent(event)
+
+    def resizeEvent(self, event):
+        self.save_overlay_settings()
+        super().resizeEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_pos is not None and event.buttons() == QtCore.Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_pos)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_pos = None
+        event.accept()
+
+    def change_font_size(self, delta):
+        self.font_size = max(6, self.font_size + delta)
+        self.text_edit.setFont(QtGui.QFont("Helvetica", self.font_size, QtGui.QFont.Weight.Bold))
+
+class App(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Train Driver 2 Translation Helper")
+        self.overlay_window = None
+        self.overlay_font_size = 10
 
         icon_path = resource_path(os.path.join('res', 'Favicon.ico'))
         if os.path.exists(icon_path):
-            self.root.iconbitmap(icon_path)
+            self.setWindowIcon(QtGui.QIcon(icon_path))
 
         self.ignore_list = load_ignore_list(resource_path(os.path.join('res', 'ignore_list.csv')))
         self.fixed_translations = load_fixed_translations(resource_path(os.path.join('res', 'fixed_translations.csv')))
+        self.scenery_names = load_scenery_names(resource_path(os.path.join('res', 'Scenery_Names.csv')))
 
-        self.language_var = tk.StringVar(self.root, "English")
-        self.service_var = tk.StringVar(self.root, "Deepl")
-        self.show_original = tk.BooleanVar()
-        self.is_dark_mode = tk.BooleanVar(value=True)
+        self.language_var = "English"
+        self.service_var = "Deepl"
+        # Dark Mode ist immer aktiv, entferne Umschalt-Logik
+        self.is_dark_mode = True
 
-        self.handlers = []   # (handler, queue, stop_event, text_area, tab_id)
+        self.handlers = []
         self.opened_logs = set()
         self.latest_log_time = None
         self.directory_path = ""
-        self.known_logs = {} # Speichert log_file_path -> letzte bekannte mtime
-
-        self.create_widgets()
-        self.check_for_updates()
-
+        self.known_logs = {}
+        self.tab_widget = None
+        self.init_ui()
+        QtCore.QTimer.singleShot(1000, self.check_for_updates)
         self.apply_theme()
 
-    def create_widgets(self):
-        main_frame = tk.Frame(self.root)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    def init_ui(self):
+        central_widget = QtWidgets.QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QtWidgets.QVBoxLayout(central_widget)
 
-        top_frame = tk.Frame(main_frame)
-        top_frame.pack(side=tk.TOP, fill=tk.X)
-        
-
+        # Top frame
+        top_layout = QtWidgets.QHBoxLayout()
         img_path = resource_path(os.path.join('res', 'image.png'))
         if os.path.exists(img_path):
             img = Image.open(img_path).resize((80, 40), Image.LANCZOS)
-            self.img_tk = ImageTk.PhotoImage(img)
-            tk.Label(top_frame, image=self.img_tk).pack(side=tk.RIGHT)
+            qt_img = ImageQt.ImageQt(img)
+            pixmap = QtGui.QPixmap.fromImage(qt_img)
+            img_label = QtWidgets.QLabel()
+            img_label.setPixmap(pixmap)
+            top_layout.addWidget(img_label)
 
-        frame1 = tk.Frame(top_frame)
-        frame1.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        file_layout = QtWidgets.QHBoxLayout()
+        file_label = QtWidgets.QLabel("TD2 Logs Path:")
+        self.file_entry = QtWidgets.QLineEdit()
+        browse_btn = QtWidgets.QPushButton("Browse")
+        browse_btn.clicked.connect(self.browse_directory)
+        file_layout.addWidget(file_label)
+        file_layout.addWidget(self.file_entry)
+        file_layout.addWidget(browse_btn)
+        top_layout.addLayout(file_layout)
+        main_layout.addLayout(top_layout)
 
-        tk.Label(frame1, text="TD2 Logs Path:").pack(side=tk.LEFT)
-        self.file_entry = tk.Entry(frame1, width=50)
-        self.file_entry.pack(side=tk.LEFT, padx=5)
-        tk.Button(frame1, text="Browse", command=self.browse_directory).pack(side=tk.LEFT)
 
-        frame2 = tk.Frame(main_frame)
-        frame2.pack(pady=5, fill=tk.X)
-
-        tk.Label(frame2, text="Target Language:").pack(side=tk.LEFT)
+        # Frame2
+        frame2 = QtWidgets.QHBoxLayout()
+        frame2.addWidget(QtWidgets.QLabel("Target Language:"))
         language_values = ["English", "American English", "German", "Polish", "French", "Spanish", "Italian", "Dutch",
                            "Portuguese", "Brazilian Portuguese", "Greek", "Swedish", "Danish", "Finnish", "Norwegian",
                            "Czech", "Slovak", "Hungarian", "Romanian", "Bulgarian", "Croatian", "Serbian", "Slovenian",
                            "Estonian", "Latvian", "Lithuanian", "Maltese", "Russian"]
-        self.language_combobox = ttk.Combobox(frame2, textvariable=self.language_var, state="readonly", values=language_values)
-        self.language_combobox.pack(side=tk.LEFT, padx=5)
+        self.language_combobox = QtWidgets.QComboBox()
+        self.language_combobox.addItems(language_values)
+        self.language_combobox.setCurrentText(self.language_var)
+        self.language_combobox.currentTextChanged.connect(lambda val: setattr(self, "language_var", val))
+        frame2.addWidget(self.language_combobox)
 
-        tk.Checkbutton(frame2, text="Show Original", variable=self.show_original).pack(side=tk.LEFT, padx=5)
+        # Entferne Show Original Checkbox
+        # self.show_original_checkbox = QtWidgets.QCheckBox("Show Original")
+        # frame2.addWidget(self.show_original_checkbox)
 
-        tk.Label(frame2, text="Translation Service:").pack(side=tk.LEFT, padx=5)
+        frame2.addWidget(QtWidgets.QLabel("Translation Service:"))
         service_values = ["ChatGPT", "Google Translate", "Deepl"]
-        self.service_combobox = ttk.Combobox(frame2, textvariable=self.service_var, state="readonly", values=service_values)
-        self.service_combobox.pack(side=tk.LEFT, padx=5)
+        self.service_combobox = QtWidgets.QComboBox()
+        self.service_combobox.addItems(service_values)
+        self.service_combobox.setCurrentText(self.service_var)
+        self.service_combobox.currentTextChanged.connect(lambda val: setattr(self, "service_var", val))
+        frame2.addWidget(self.service_combobox)
+        main_layout.addLayout(frame2)
 
-        frame3 = tk.Frame(main_frame)
-        frame3.pack(pady=5, fill=tk.X)
-        tk.Button(frame3, text="Close Selected Tab", command=self.close_selected_tab).pack(side=tk.LEFT, padx=5)
-        tk.Button(frame3, text="Toggle Overlay", command=self.toggle_overlay).pack(side=tk.LEFT, padx=5)
-        tk.Button(frame3, text="A+", command=lambda: self.change_overlay_font_size(1)).pack(side=tk.LEFT, padx=5)
-        tk.Button(frame3, text="A−", command=lambda: self.change_overlay_font_size(-1)).pack(side=tk.LEFT, padx=5)
+        # Frame3
+        frame3 = QtWidgets.QHBoxLayout()
+        close_tab_btn = QtWidgets.QPushButton("Close Selected Tab")
+        close_tab_btn.clicked.connect(self.close_selected_tab)
+        frame3.addWidget(close_tab_btn)
+        overlay_btn = QtWidgets.QPushButton("Toggle Overlay")
+        overlay_btn.clicked.connect(self.toggle_overlay)
+        frame3.addWidget(overlay_btn)
+        aplus_btn = QtWidgets.QPushButton("A+")
+        aplus_btn.clicked.connect(lambda: self.change_overlay_font_size(1))
+        frame3.addWidget(aplus_btn)
+        aminus_btn = QtWidgets.QPushButton("A−")
+        aminus_btn.clicked.connect(lambda: self.change_overlay_font_size(-1))
+        frame3.addWidget(aminus_btn)
+        # Entferne Dark Mode Checkbox
+        # self.dark_mode_checkbox = QtWidgets.QCheckBox("Dark Mode")
+        # self.dark_mode_checkbox.setChecked(self.is_dark_mode)
+        # self.dark_mode_checkbox.stateChanged.connect(self.on_dark_mode_checkbox_changed)
+        # frame3.addWidget(self.dark_mode_checkbox)
+        main_layout.addLayout(frame3)
 
-        tk.Checkbutton(frame3, text="Dark Mode", variable=self.is_dark_mode, command=self.apply_theme).pack(side=tk.LEFT, padx=5)
-
-        self.notebook = ttk.Notebook(main_frame)
-        self.notebook.pack(fill=tk.BOTH, expand=True, pady=10)
-
+        # Tabs
+        self.tab_widget = QtWidgets.QTabWidget()
+        self.tab_widget.setTabsClosable(False)
+        self.tab_widget.setMovable(True)
+        self.tab_widget.tabCloseRequested.connect(self.close_selected_tab)
+        main_layout.addWidget(self.tab_widget)
     def browse_directory(self):
-        directory_path = filedialog.askdirectory(initialdir=os.path.expanduser("~/Documents/TTSK/TrainDriver2/Logs"), title="Select Log Directory")
+        dialog = QtWidgets.QFileDialog(self)
+        directory_path = dialog.getExistingDirectory(self, "Select Log Directory", os.path.expanduser("~/Documents/TTSK/TrainDriver2/Logs"))
         if directory_path:
             self.directory_path = directory_path
-            self.file_entry.delete(0, tk.END)
-            self.file_entry.insert(0, directory_path)
-
+            self.file_entry.setText(directory_path)
             newest = self.find_newest_log_file(directory_path)
             if newest:
                 self.open_log_in_new_tab(newest)
                 self.latest_log_time = os.path.getctime(newest)
-
-            # Alle Logs merken (mtime)
             self.record_all_logs()
-
             self.monitor_new_logs()
 
     def record_all_logs(self):
@@ -372,51 +497,36 @@ class App:
         if log_file_path in self.opened_logs:
             return
         self.opened_logs.add(log_file_path)
-
-        frame = tk.Frame(self.notebook)
-        tab_id = self.notebook.add(frame, text=os.path.basename(log_file_path))
-
-        text_area = tk.Text(frame, wrap=tk.WORD, height=20, width=80)
-        text_area.pack(fill=tk.BOTH, expand=True)
-        text_area.tag_config('fahrdienstleiter', foreground='#DF7676', font=("Helvetica", 10, "bold"))
-        text_area.tag_config('translated', foreground='orange', font=("Helvetica", 10, "bold"))
-        text_area.tag_config('swdr', foreground='green', font=("Helvetica", 10, "bold"))
-        text_area.tag_config('original', font=("Helvetica", 10, "bold"))
-        self.apply_theme()
-
-        queue = Queue()
-        stop_event = Event()
+        text_area = QtWidgets.QTextEdit()
+        text_area.setReadOnly(True)
+        text_area.setFont(QtGui.QFont("Helvetica", 10))
+        idx = self.tab_widget.addTab(text_area, os.path.basename(log_file_path))
         handler = LogHandler(
             log_file_path=log_file_path,
-            text_widget=text_area,
-            language_var=self.language_var,
-            service_var=self.service_var,
-            queue=queue,
-            stop_event=stop_event,
-            show_original=self.show_original,
+            language_var=lambda: self.language_var,
+            service_var=lambda: self.service_var,
             ignore_list=self.ignore_list,
-            fixed_translations=self.fixed_translations
+            fixed_translations=self.fixed_translations,
+            scenery_names=self.scenery_names
         )
-
+        handler.lines_translated.connect(lambda lines: self.process_lines(handler, text_area, lines))
         handler.file.seek(0, os.SEEK_END)
         latest_message = None
-        while (line := handler.file.readline()):
+        while True:
+            line = handler.file.readline()
+            if not line:
+                break
             if "ChatMessage:" in line and handler.contains_time(line):
                 clean_line = handler.clean_chat_message(line)
                 if clean_line:
                     latest_message = clean_line
-
         if latest_message:
-            queue.put([latest_message])
-
+            handler.lines_translated.emit([latest_message])
         handler.last_position = handler.file.tell()
-        handler.check_new_lines()
-
-        t = Thread(target=self.process_queue_for_handler, args=(handler, queue, text_area, stop_event), daemon=True)
-        t.start()
-
-        self.handlers.append((handler, queue, stop_event, text_area, tab_id))
-        self.apply_original_tag_colors()
+        timer = QtCore.QTimer(self)
+        timer.timeout.connect(handler.check_new_lines)
+        timer.start(5000)
+        self.handlers.append((handler, text_area, timer, idx))
 
     def monitor_new_logs(self):
         if self.directory_path:
@@ -435,203 +545,144 @@ class App:
                 # Aktualisiere known_logs mit neuem mtime
                 self.known_logs[lf] = mtime
 
-        self.root.after(10000, self.monitor_new_logs)
+        QtCore.QTimer.singleShot(10000, self.monitor_new_logs)
 
     def apply_theme(self):
-        if self.is_dark_mode.get():
-            bg_color = "#2E2E2E"
-            fg_color = "#FFFFFF"
-            text_area_bg = "#3E3E3E"
-            text_area_fg = "#FFFFFF"
-            button_bg = "#4E4E4E"
-            button_fg = "#FFFFFF"
-        else:
-            bg_color = "#FFFFFF"
-            fg_color = "#000000"
-            text_area_bg = "#FFFFFF"
-            text_area_fg = "#000000"
-            button_bg = "#F0F0F0"
-            button_fg = "#000000"
+        # Dark Mode immer aktiv
+        bg_color = "#2E2E2E"
+        fg_color = "#FFFFFF"
+        text_area_bg = "#3E3E3E"
+        text_area_fg = "#FFFFFF"
+        button_bg = "#4E4E4E"
+        button_fg = "#FFFFFF"
 
-        self.root.configure(bg=bg_color)
+        self.setStyleSheet(f"""
+            QWidget {{ background-color: {bg_color}; color: {fg_color}; }}
+            QLineEdit, QTextEdit, QComboBox {{ background-color: {text_area_bg}; color: {text_area_fg}; }}
+            QPushButton {{ background-color: {button_bg}; color: {button_fg}; }}
+            QCheckBox {{ background-color: {bg_color}; color: {fg_color}; }}
+        """)
 
-        style = ttk.Style(self.root)
-        style.theme_use("clam")
-        style.configure("Light.TCombobox", fieldbackground="#000000", foreground="#000000")
-        style.configure("Dark.TCombobox", fieldbackground="#000000", foreground="#000000")
-
-        if self.is_dark_mode.get():
-            self.language_combobox.configure(style="Dark.TCombobox")
-            self.service_combobox.configure(style="Dark.TCombobox")
-        else:
-            self.language_combobox.configure(style="Light.TCombobox")
-            self.service_combobox.configure(style="Light.TCombobox")
-
-        self._update_widget_theme(self.root, bg_color, fg_color, text_area_bg, text_area_fg, button_bg, button_fg)
         self.apply_original_tag_colors()
 
+    def process_lines(self, handler, text_area, lines):
+        translated_lines = handler.translate_lines(lines)
+
+        for line, line_type in translated_lines:
+            cursor = text_area.textCursor()
+            cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+            fmt = QtGui.QTextCharFormat()
+            if line_type == "fahrdienstleiter":
+                fmt.setForeground(QtGui.QColor("#DF7676"))
+                fmt.setFontWeight(QtGui.QFont.Weight.Bold)
+            elif line_type == "translated":
+                fmt.setForeground(QtGui.QColor("orange"))
+                fmt.setFontWeight(QtGui.QFont.Weight.Bold)
+            elif line_type == "swdr":
+                fmt.setForeground(QtGui.QColor("green"))
+                fmt.setFontWeight(QtGui.QFont.Weight.Bold)
+            elif line_type == "original":
+                fmt.setFontWeight(QtGui.QFont.Weight.Bold)
+                fmt.setForeground(QtGui.QColor("#FFFFFF" if self.is_dark_mode else "#000000"))
+            cursor.insertText(line + "\n", fmt)
+            text_area.setTextCursor(cursor)
+            text_area.ensureCursorVisible()
+
+        # Overlay sofort synchronisieren, falls aktiv
+        if self.overlay_window and self.overlay_window.isVisible():
+            self.start_overlay_sync(text_area)
+
     def apply_original_tag_colors(self):
-        # Original-Tag-Farbe je nach Dark-Mode
-        original_fg = "#FFFFFF" if self.is_dark_mode.get() else "#000000"
-        for handler, queue, stop_event, text_area, tab_id in self.handlers:
-            text_area.tag_config("original", foreground=original_fg)
+        # Keine separate Tag-Konfiguration nötig, da QTextCharFormat genutzt wird
+        pass
 
-    def _update_widget_theme(self, widget, bg_color, fg_color, text_area_bg, text_area_fg, button_bg, button_fg):
-        widget_type = widget.winfo_class()
-        if widget_type in ["Frame", "LabelFrame"]:
-            widget.configure(bg=bg_color)
-        elif widget_type == "Label":
-            widget.configure(bg=bg_color, fg=fg_color)
-        elif widget_type == "Entry":
-            widget.configure(bg=text_area_bg, fg=text_area_fg)
-        elif widget_type == "Text":
-            widget.configure(bg=text_area_bg, fg=text_area_fg)
-        elif widget_type == "Button":
-            widget.configure(bg=button_bg, fg=button_fg)
-        elif widget_type == "Checkbutton":
-            widget.configure(bg=bg_color, fg=fg_color, selectcolor=bg_color)
-
-        for child in widget.winfo_children():
-            self._update_widget_theme(child, bg_color, fg_color, text_area_bg, text_area_fg, button_bg, button_fg)
-
-    def process_queue_for_handler(self, handler, queue, text_area, stop_event):
-        while True:
-            lines = queue.get()
-            if stop_event.is_set():
-                queue.task_done()
-                break
-            translated_lines = handler.translate_lines(lines)
-            for line, line_type in translated_lines:
-                text_area.insert(tk.END, f"{line}\n", line_type)
-                text_area.see(tk.END)
-            queue.task_done()
-
-    def close_selected_tab(self):
-        current_tab = self.notebook.index(self.notebook.select())
-        if current_tab == -1:
+    def close_selected_tab(self, idx=None):
+        if idx is None:
+            idx = self.tab_widget.currentIndex()
+        if idx == -1 or idx >= len(self.handlers):
             return
-        handler, queue, stop_event, text_area, tab_id = self.handlers[current_tab]
-        stop_event.set()
+        handler, text_area, timer, tab_idx = self.handlers[idx]
+        handler.stop_event.set()
         if handler.file:
             handler.file.close()
-        self.notebook.forget(current_tab)
-        del self.handlers[current_tab]
+        timer.stop()
+        self.tab_widget.removeTab(idx)
+        del self.handlers[idx]
 
     def check_for_updates(self):
         try:
             response = requests.get("https://api.github.com/repos/bravuralion/TD2-Chat-Translator/releases/latest")
             response.raise_for_status()
             latest_release = response.json()
-            latest_version = latest_release['tag_name']
-            if latest_version > current_version:
-                if messagebox.askyesno("Update Available", f"A new version {latest_version} is available. Download?"):
+            latest_version = latest_release['tag_name']  # z.B. "0.2.8"
+            if version.parse(latest_version) > version.parse(current_version):
+                reply = QtWidgets.QMessageBox.question(
+                    self,
+                    "Update Available",
+                    f"A new version {latest_version} is available. Download?",
+                )
+                if reply == QtWidgets.QMessageBox.StandardButton.Yes:
                     download_url = latest_release['assets'][0]['browser_download_url']
-                    os.system(f"start {download_url}")
-        except Exception:
-            pass
+                    os.startfile(download_url)
+        except Exception as e:
+            print(f"Update check failed: {e}")
 
-    def on_closing(self):
-        for handler, queue, stop_event, text_area, tab_id in self.handlers:
-            stop_event.set()
+    def closeEvent(self, event):
+        for handler, text_area, timer, tab_idx in self.handlers:
+            handler.stop_event.set()
             if handler.file:
                 handler.file.close()
-        self.root.destroy()
+            timer.stop()
+        if self.overlay_window:
+            self.overlay_window.save_overlay_settings()  # Save before closing
+            self.overlay_window.close()
+        event.accept()
+
     def toggle_overlay(self):
-        if self.overlay_window and self.overlay_window.winfo_exists():
-            self.overlay_window.destroy()
+        if self.overlay_window and self.overlay_window.isVisible():
+            self.overlay_window.close()
             self.overlay_window = None
         else:
-            self.overlay_window = tk.Toplevel(self.root)
-            self.overlay_window.title("Overlay")
-            self.overlay_window.overrideredirect(True)
-            self.overlay_window.resizable(True, True) 
-            self.overlay_window.attributes('-topmost', True)
-            self.overlay_window.geometry("400x200+100+100")
-            self.overlay_window.attributes("-alpha", 0.95)
-            self.overlay_window.configure(bg="#000000" if self.is_dark_mode.get() else "#FFFFFF")
-
-            self.overlay_text = tk.Text(self.overlay_window, wrap=tk.WORD, height=20, width=50,
-                                        bg="#3E3E3E" if self.is_dark_mode.get() else "#FFFFFF",
-                                        fg="#FFFFFF" if self.is_dark_mode.get() else "#000000",
-                                        font=("Helvetica", self.overlay_font_size, "bold"),
-                                        borderwidth=0)
-            self.overlay_text.pack(fill=tk.BOTH, expand=True)
-            self.overlay_text.tag_config('fahrdienstleiter', foreground='#DF7676')
-            self.overlay_text.tag_config('translated', foreground='orange')
-            self.overlay_text.tag_config('swdr', foreground='green')
-            self.overlay_text.tag_config('original', foreground='#FFFFFF' if self.is_dark_mode.get() else '#000000')
-
-
-            self.make_overlay_draggable()
-            if self.handlers:
-                handler, queue, stop_event, main_text_area, tab_id = self.handlers[-1]
-                self.start_overlay_sync(main_text_area)
-            sizegrip = ttk.Sizegrip(self.overlay_window)
-            sizegrip.place(relx=1.0, rely=1.0, anchor="se")
+            self.overlay_window = OverlayWindow(dark_mode=self.is_dark_mode, font_size=self.overlay_font_size)
+            self.overlay_window.show()
+            # Zeige nur die zuletzt aktive Tab-Übersetzung im Overlay
+            current_tab = self.tab_widget.currentIndex()
+            if current_tab != -1:
+                handler, text_area, timer, tab_idx = self.handlers[current_tab]
+                self.start_overlay_sync(text_area)
 
     def start_overlay_sync(self, source_text_widget):
         def sync():
-            if not self.overlay_window or not self.overlay_window.winfo_exists():
+            # Zeige nur die aktuell ausgewählte Tab-Übersetzung im Overlay
+            if not self.overlay_window or not self.overlay_window.isVisible():
                 return
-
-            self.overlay_text.config(state="normal")
-            self.overlay_text.delete("1.0", tk.END)
-
-            # Ganzen Text kopieren
-            full_text = source_text_widget.get("1.0", tk.END)
-            self.overlay_text.insert("1.0", full_text)
-
-            # Alle Tags im Quell-Widget durchgehen
-            for tag in source_text_widget.tag_names():
-                tag_ranges = source_text_widget.tag_ranges(tag)
-                for i in range(0, len(tag_ranges), 2):
-                    start = tag_ranges[i]
-                    end = tag_ranges[i+1]
-                    self.overlay_text.tag_add(tag, start, end)
-
-            self.overlay_text.config(state="disabled")
-            self.overlay_text.see(tk.END)
-            self.root.after(1000, sync)
+            current_tab = self.tab_widget.currentIndex()
+            # Prüfe, ob der source_text_widget noch der aktive Tab ist
+            if current_tab != -1 and self.handlers[current_tab][1] is source_text_widget:
+                self.overlay_window.text_edit.setPlainText("")  # Clear first
+                src_cursor = source_text_widget.textCursor()
+                src_cursor.movePosition(QtGui.QTextCursor.MoveOperation.Start)
+                while not src_cursor.atEnd():
+                    src_cursor.select(QtGui.QTextCursor.SelectionType.LineUnderCursor)
+                    line_text = src_cursor.selectedText()
+                    fmt = src_cursor.charFormat()
+                    overlay_cursor = self.overlay_window.text_edit.textCursor()
+                    overlay_cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+                    overlay_cursor.insertText(line_text + "\n", fmt)
+                    self.overlay_window.text_edit.setTextCursor(overlay_cursor)
+                    src_cursor.movePosition(QtGui.QTextCursor.MoveOperation.Down)
+                self.overlay_window.text_edit.ensureCursorVisible()
+            QtCore.QTimer.singleShot(1000, lambda: self.start_overlay_sync(source_text_widget))
         sync()
 
-
-
-    def make_overlay_draggable(self):
-        def start_move(event):
-            self._x = event.x
-            self._y = event.y
-
-        def do_move(event):
-            deltax = event.x - self._x
-            deltay = event.y - self._y
-            x = self.overlay_window.winfo_x() + deltax
-            y = self.overlay_window.winfo_y() + deltay
-            self.overlay_window.geometry(f"+{x}+{y}")
-
-        self.overlay_window.bind("<ButtonPress-1>", start_move)
-        self.overlay_window.bind("<B1-Motion>", do_move)
-
-    def on_closing(self):
-        for handler, queue, stop_event, text_area, tab_id in self.handlers:
-            stop_event.set()
-            if handler.file:
-                handler.file.close()
-        if self.overlay_window and self.overlay_window.winfo_exists():
-            self.overlay_window.destroy()
-        self.root.destroy()
     def change_overlay_font_size(self, delta):
-        if not self.overlay_window or not self.overlay_window.winfo_exists():
+        if not self.overlay_window or not self.overlay_window.isVisible():
             return
         self.overlay_font_size = max(6, self.overlay_font_size + delta)
-        self.overlay_text.configure(font=("Helvetica", self.overlay_font_size, "bold"))
-
-
+        self.overlay_window.change_font_size(delta)
 if __name__ == "__main__":
-    root = tk.Tk()
+    app = QtWidgets.QApplication(sys.argv)
+    main_win = App()
+    main_win.show()
+    sys.exit(app.exec())
 
-    # DPI-Skalierung für Tk setzen
-    root.tk.call('tk', 'scaling', _dpi_scaling)
-
-    app = App(root)
-    root.protocol("WM_DELETE_WINDOW", app.on_closing)
-    root.mainloop()
