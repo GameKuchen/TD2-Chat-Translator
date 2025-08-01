@@ -13,12 +13,13 @@ from PIL import Image, ImageQt
 import httpcore
 setattr(httpcore, 'SyncHTTPTransport', 'AsyncHTTPProxy')
 from googletrans import Translator
+from pynput import keyboard as pynput_keyboard
 import csv
 import time
 from packaging import version
 from concurrent.futures import ThreadPoolExecutor
 import json
-current_version = "0.2.7"
+current_version = "0.3.1"
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev und for PyInstaller """
@@ -49,13 +50,11 @@ def load_fixed_translations(filepath):
 
 def load_scenery_names(filepath):
     with open(filepath, 'r', encoding='utf-8') as file:
-        # Alle Namen als Set, ohne Leerzeichen am Anfang/Ende
         return {line.strip() for line in file if line.strip()}
 
 class LogHandler(QtCore.QObject):
     lines_translated = QtCore.pyqtSignal(list)
 
-    # Entferne 'show_original' aus der __init__-Signatur
     def __init__(self, log_file_path, language_var, service_var, ignore_list, fixed_translations, scenery_names):
         super().__init__()
         self.log_file_path = log_file_path
@@ -101,7 +100,7 @@ class LogHandler(QtCore.QObject):
     def translate_lines(self, lines):
         translated_lines = []
         # Begrenze die Anzahl paralleler Threads für Google Translate auf 1, um Hänger zu vermeiden
-        max_workers = 1 if (self.service_var() if callable(self.service_var) else self.service_var) == "Google Translate" else 3
+        max_workers = 1 if (self.service_var() if callable(self.service_var) else self.service_var) == "Google Translate" else 4
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_line = {}
             for line in lines:
@@ -125,7 +124,6 @@ class LogHandler(QtCore.QObject):
                 translation_service = self.service_var() if callable(self.service_var) else self.service_var
                 self.target_language = current_target_language
 
-                # Entferne show_original Logik
                 future = executor.submit(self.translate_message, message, translation_service)
                 future_to_line[future] = (timestamp_user, tag)
             for future in future_to_line:
@@ -138,14 +136,14 @@ class LogHandler(QtCore.QObject):
     def translate_message(self, text, translation_service):
         current_target_language = self.target_language
         text_lower = text.lower()
-        # Prüfe zuerst auf fixed translations, egal welcher Service
+
         if (
             text_lower in self.fixed_translations  
             and current_target_language in self.fixed_translations[text_lower]
         ):
             return self.fixed_translations[text_lower][current_target_language]
 
-        # Maskiere Szenerie-Namen vor Übersetzung
+
         masked_text, mask_map = self._mask_scenery_names(text)
 
         if translation_service == "ChatGPT":
@@ -157,14 +155,13 @@ class LogHandler(QtCore.QObject):
         else:
             translated = masked_text
 
-        # Entmaske die Szenerie-Namen wieder
+
         return self._unmask_scenery_names(translated, mask_map)
 
     def _mask_scenery_names(self, text):
         mask_map = {}
         masked_text = text
         for name in sorted(self.scenery_names, key=len, reverse=True):
-            # Nur ganze Wörter ersetzen, case-insensitive
             pattern = r'\b' + re.escape(name) + r'\b'
             mask = f"__SCENERY_{hash(name)}__"
             if re.search(pattern, masked_text):
@@ -213,8 +210,6 @@ class LogHandler(QtCore.QObject):
     def translate_with_google(self, text):
         try:
             result = self.translator.translate(text, dest=self.target_language)
-            # googletrans v4+ benötigt ein laufendes Event Loop für async, aber ThreadPoolExecutor-Worker haben keins.
-            # Lösung: Erzwinge die Nutzung eines eigenen Event Loops, falls nötig.
             if hasattr(result, "__await__"):
                 import asyncio
                 try:
@@ -274,7 +269,6 @@ class OverlayWindow(QtWidgets.QWidget):
 
     def __init__(self, parent=None, dark_mode=True, font_size=10):
         super().__init__(parent)
-        # Rahmenlos und immer oben, aber auch resizable und dragbar
         self.setWindowFlags(
             QtCore.Qt.WindowType.FramelessWindowHint |
             QtCore.Qt.WindowType.WindowStaysOnTopHint |
@@ -286,6 +280,8 @@ class OverlayWindow(QtWidgets.QWidget):
         self.font_size = font_size
         self.text_edit = QtWidgets.QTextEdit(self)
         self.text_edit.setReadOnly(True)
+        self.text_edit.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.text_edit.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.text_edit.setFont(QtGui.QFont("Helvetica", self.font_size, QtGui.QFont.Weight.Bold))
         self.text_edit.setStyleSheet(
             f"background-color: {'#3E3E3E' if dark_mode else '#FFFFFF'}; color: {'#FFFFFF' if dark_mode else '#000000'};"
@@ -370,7 +366,6 @@ class App(QtWidgets.QMainWindow):
 
         self.language_var = "English"
         self.service_var = "Deepl"
-        # Dark Mode ist immer aktiv, entferne Umschalt-Logik
         self.is_dark_mode = True
 
         self.handlers = []
@@ -382,6 +377,18 @@ class App(QtWidgets.QMainWindow):
         self.init_ui()
         QtCore.QTimer.singleShot(1000, self.check_for_updates)
         self.apply_theme()
+        self.global_hotkey_listener = pynput_keyboard.Listener(on_press=self._on_global_key)
+        self.global_hotkey_listener.start()
+        f10_shortcut = QtGui.QShortcut(QtGui.QKeySequence("F10"), self)
+        f10_shortcut.activated.connect(self.toggle_overlay)
+
+    def _on_global_key(self, key):
+        try:
+            if key == pynput_keyboard.Key.f10:
+                # In den Qt-Thread hoppen, damit's GUI-sicher ist
+                QtCore.QTimer.singleShot(0, self.toggle_overlay)
+        except Exception:
+            pass
 
     def init_ui(self):
         central_widget = QtWidgets.QWidget()
@@ -424,10 +431,6 @@ class App(QtWidgets.QMainWindow):
         self.language_combobox.currentTextChanged.connect(lambda val: setattr(self, "language_var", val))
         frame2.addWidget(self.language_combobox)
 
-        # Entferne Show Original Checkbox
-        # self.show_original_checkbox = QtWidgets.QCheckBox("Show Original")
-        # frame2.addWidget(self.show_original_checkbox)
-
         frame2.addWidget(QtWidgets.QLabel("Translation Service:"))
         service_values = ["ChatGPT", "Google Translate", "Deepl"]
         self.service_combobox = QtWidgets.QComboBox()
@@ -451,11 +454,7 @@ class App(QtWidgets.QMainWindow):
         aminus_btn = QtWidgets.QPushButton("A−")
         aminus_btn.clicked.connect(lambda: self.change_overlay_font_size(-1))
         frame3.addWidget(aminus_btn)
-        # Entferne Dark Mode Checkbox
-        # self.dark_mode_checkbox = QtWidgets.QCheckBox("Dark Mode")
-        # self.dark_mode_checkbox.setChecked(self.is_dark_mode)
-        # self.dark_mode_checkbox.stateChanged.connect(self.on_dark_mode_checkbox_changed)
-        # frame3.addWidget(self.dark_mode_checkbox)
+
         main_layout.addLayout(frame3)
 
         # Tabs
@@ -478,7 +477,6 @@ class App(QtWidgets.QMainWindow):
             self.monitor_new_logs()
 
     def record_all_logs(self):
-        # Speichere mtime aller Logs, damit wir Veränderungen feststellen können
         if not self.directory_path:
             return
         log_files = [os.path.join(self.directory_path, f) for f in os.listdir(self.directory_path)
@@ -530,17 +528,13 @@ class App(QtWidgets.QMainWindow):
 
     def monitor_new_logs(self):
         if self.directory_path:
-            # Prüfe alle Logs erneut
             log_files = [os.path.join(self.directory_path, f) for f in os.listdir(self.directory_path)
                          if os.path.isfile(os.path.join(self.directory_path, f)) and "Log" in f]
             for lf in log_files:
                 mtime = os.path.getmtime(lf)
                 if lf not in self.opened_logs:
-                    # Kann dieses ältere Log aktiv sein?
-                    # Wir vergleichen mtime mit previously known mtime
                     old_mtime = self.known_logs.get(lf, None)
                     if old_mtime is not None and mtime > old_mtime:
-                        # Log hat sich geändert, also aktiv geworden
                         self.open_log_in_new_tab(lf)
                 # Aktualisiere known_logs mit neuem mtime
                 self.known_logs[lf] = mtime
@@ -567,9 +561,10 @@ class App(QtWidgets.QMainWindow):
 
     def process_lines(self, handler, text_area, lines):
         translated_lines = handler.translate_lines(lines)
+        max_lines = 50
+        cursor = text_area.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
         for line, line_type in translated_lines:
-            cursor = text_area.textCursor()
-            cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
             fmt = QtGui.QTextCharFormat()
             if line_type == "fahrdienstleiter":
                 fmt.setForeground(QtGui.QColor("#DF7676"))
@@ -580,16 +575,18 @@ class App(QtWidgets.QMainWindow):
             elif line_type == "swdr":
                 fmt.setForeground(QtGui.QColor("green"))
                 fmt.setFontWeight(QtGui.QFont.Weight.Bold)
-            elif line_type == "original":
-                # Diese Zeile ist überflüssig, da "original" nie erzeugt wird
-                # fmt.setFontWeight(QtGui.QFont.Weight.Bold)
-                # fmt.setForeground(QtGui.QColor("#FFFFFF" if self.is_dark_mode else "#000000"))
-                pass
             cursor.insertText(line + "\n", fmt)
             text_area.setTextCursor(cursor)
             text_area.ensureCursorVisible()
-
-        # Overlay sofort synchronisieren, falls aktiv
+        doc = text_area.document()
+        if doc.blockCount() > max_lines:
+            cursor = text_area.textCursor()
+            cursor.movePosition(QtGui.QTextCursor.MoveOperation.Start)
+            for _ in range(doc.blockCount() - max_lines):
+                cursor.select(QtGui.QTextCursor.SelectionType.LineUnderCursor)
+                cursor.removeSelectedText()
+                cursor.deleteChar()
+            text_area.setTextCursor(cursor)
         if self.overlay_window and self.overlay_window.isVisible():
             self.start_overlay_sync(text_area)
 
@@ -637,6 +634,9 @@ class App(QtWidgets.QMainWindow):
         if self.overlay_window:
             self.overlay_window.save_overlay_settings()  # Save before closing
             self.overlay_window.close()
+        if hasattr(self, 'global_hotkey_listener') and self.global_hotkey_listener is not None:
+            self.global_hotkey_listener.stop()
+            self.global_hotkey_listener.join()
         event.accept()
 
     def toggle_overlay(self):
@@ -672,7 +672,7 @@ class App(QtWidgets.QMainWindow):
                     overlay_cursor.insertText(line_text + "\n", fmt)
                     self.overlay_window.text_edit.setTextCursor(overlay_cursor)
                     src_cursor.movePosition(QtGui.QTextCursor.MoveOperation.Down)
-                self.overlay_window.text_edit.ensureCursorVisible()
+                #self.overlay_window.text_edit.ensureCursorVisible()
             QtCore.QTimer.singleShot(1000, lambda: self.start_overlay_sync(source_text_widget))
         sync()
 
