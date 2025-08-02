@@ -19,7 +19,7 @@ import time
 from packaging import version
 from concurrent.futures import ThreadPoolExecutor
 import json
-current_version = "0.3.1"
+current_version = "0.3.2"
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev und for PyInstaller """
@@ -672,7 +672,7 @@ class App(QtWidgets.QMainWindow):
                     overlay_cursor.insertText(line_text + "\n", fmt)
                     self.overlay_window.text_edit.setTextCursor(overlay_cursor)
                     src_cursor.movePosition(QtGui.QTextCursor.MoveOperation.Down)
-                #self.overlay_window.text_edit.ensureCursorVisible()
+                self.overlay_window.text_edit.ensureCursorVisible()
             QtCore.QTimer.singleShot(1000, lambda: self.start_overlay_sync(source_text_widget))
         sync()
 
