@@ -2,8 +2,9 @@ from email.mime import text
 import os
 import sys
 import re
+from xml.sax import handler
 from PyQt6 import QtWidgets, QtGui, QtCore
-import openai
+from openai import OpenAI
 import deepl
 import requests
 import configparser
@@ -17,9 +18,9 @@ from pynput import keyboard as pynput_keyboard
 import csv
 import time
 from packaging import version
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, thread
 import json
-current_version = "0.3.2"
+current_version = "0.3.5"
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev und for PyInstaller """
@@ -28,8 +29,24 @@ def resource_path(relative_path):
 
 config = configparser.ConfigParser()
 config.read(resource_path('config.cfg'))
-openai.api_key = config['DEFAULT']['OPENAI_API_KEY']
+client = OpenAI(api_key=config['DEFAULT']['OPENAI_API_KEY'])
 deepl_api_key = config['DEFAULT']['deepl_api_key']
+
+class TranslationWorker(QtCore.QObject):
+    finished = QtCore.pyqtSignal(list)
+    def __init__(self, handler, lines):
+        super().__init__()
+        self.handler = handler
+        self.lines = lines
+        self.cancelled = False
+
+    def run(self):
+        if self.cancelled:
+            return
+        results = self.handler.translate_lines(self.lines)
+        if not self.cancelled:  
+            self.finished.emit(results)
+
 
 def load_ignore_list(filepath):
     with open(filepath, 'r', encoding='utf-8') as file:
@@ -40,7 +57,7 @@ def load_fixed_translations(filepath):
     with open(filepath, 'r', encoding='utf-8') as file:
         reader = csv.DictReader(file)
         for row in reader:
-            text = row['text'].strip().lower()  # Kleinbuchstaben fürs Matching
+            text = row['text'].strip().lower()  
             language = row['language'].strip()
             translation = row['translation'].strip()
             if text not in fixed_translations:
@@ -68,6 +85,8 @@ class LogHandler(QtCore.QObject):
         self.deepl_translator = deepl.Translator(deepl_api_key)
         self.last_position = self.file.tell()
         self.stop_event = Event()
+        self.openai_client = OpenAI(api_key=config['DEFAULT']['OPENAI_API_KEY'])
+
 
     @staticmethod
     def contains_time(line):
@@ -99,7 +118,6 @@ class LogHandler(QtCore.QObject):
 
     def translate_lines(self, lines):
         translated_lines = []
-        # Begrenze die Anzahl paralleler Threads für Google Translate auf 1, um Hänger zu vermeiden
         max_workers = 1 if (self.service_var() if callable(self.service_var) else self.service_var) == "Google Translate" else 4
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_line = {}
@@ -176,36 +194,41 @@ class LogHandler(QtCore.QObject):
 
     def translate_with_chatgpt(self, text):
         try:
-            client = openai.OpenAI(api_key=openai.api_key)
-            thread = client.beta.threads.create()
-            client.beta.threads.messages.create(
+            thread = self.openai_client.beta.threads.create()
+            self.openai_client.beta.threads.messages.create(
                 thread_id=thread.id,
                 role="user",
-                content=f"Translate the following Sentence to {self.target_language}, Only provide the translation without any explanations or additional text. If there are parts that cannot be translated (e.g., names, emojis), leave those unchanged, and translate the rest. if necessary translate word by word: {text}"
+                content=(
+                    f"Translate the following Sentence to {self.target_language}. "
+                    f"Only provide the translation without any explanations or additional text. "
+                    f"If there are parts that cannot be translated (e.g., names, emojis), leave those unchanged: {text}"
+                )
             )
 
-            run = client.beta.threads.runs.create_and_poll(
+            run = self.openai_client.beta.threads.runs.create_and_poll(
                 thread_id=thread.id,
                 assistant_id="asst_dxWUY2bN5TSwZXi09Q7HKITj",
-                instructions="You are a translator. Translate the text provided to you to the requested languages without any additional explanations. The Source can be in multiple languages. Refer to the uploaded translations PDF first for predefined translations. Only reply with the requested target language."
+                instructions=(
+                    "You are a translator. Translate the text to the requested language only. "
+                    "Do not explain anything. Keep names and symbols unchanged."
+                )
             )
 
             if run.status == 'completed':
-                messages = client.beta.threads.messages.list(thread_id=thread.id)
+                messages = self.openai_client.beta.threads.messages.list(thread_id=thread.id)
                 message_data = messages.data
                 if message_data:
-                    last_message = message_data[0]
-                    if last_message.content:
-                        text_content_block = last_message.content[0]
-                        return text_content_block.text.value.strip()
-                    else:
-                        return "No content found in the last message"
-                else:
-                    return "No messages found"
+                    for message in reversed(message_data):
+                        if message.role == "assistant" and message.content:
+                            return message.content[0].text.value.strip()
+                    return "No assistant message found"
+                return "No messages found"
             else:
-                return run.status
+                return f"Run not completed. Status: {run.status}"
+
         except Exception as e:
-            return str(e)
+            return f"[ChatGPT Error] {str(e)}"
+
 
     def translate_with_google(self, text):
         try:
@@ -292,7 +315,6 @@ class OverlayWindow(QtWidgets.QWidget):
         self.setLayout(layout)
         self._drag_pos = None
 
-        # Add a resize handle in the lower right corner
         self.size_grip = QtWidgets.QSizeGrip(self)
         layout.addWidget(self.size_grip, 0, QtCore.Qt.AlignmentFlag.AlignBottom | QtCore.Qt.AlignmentFlag.AlignRight)
 
@@ -385,7 +407,6 @@ class App(QtWidgets.QMainWindow):
     def _on_global_key(self, key):
         try:
             if key == pynput_keyboard.Key.f10:
-                # In den Qt-Thread hoppen, damit's GUI-sicher ist
                 QtCore.QTimer.singleShot(0, self.toggle_overlay)
         except Exception:
             pass
@@ -560,38 +581,25 @@ class App(QtWidgets.QMainWindow):
         self.apply_original_tag_colors()
 
     def process_lines(self, handler, text_area, lines):
-        translated_lines = handler.translate_lines(lines)
-        max_lines = 50
-        cursor = text_area.textCursor()
-        cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
-        for line, line_type in translated_lines:
-            fmt = QtGui.QTextCharFormat()
-            if line_type == "fahrdienstleiter":
-                fmt.setForeground(QtGui.QColor("#DF7676"))
-                fmt.setFontWeight(QtGui.QFont.Weight.Bold)
-            elif line_type == "translated":
-                fmt.setForeground(QtGui.QColor("orange"))
-                fmt.setFontWeight(QtGui.QFont.Weight.Bold)
-            elif line_type == "swdr":
-                fmt.setForeground(QtGui.QColor("green"))
-                fmt.setFontWeight(QtGui.QFont.Weight.Bold)
-            cursor.insertText(line + "\n", fmt)
-            text_area.setTextCursor(cursor)
-            text_area.ensureCursorVisible()
-        doc = text_area.document()
-        if doc.blockCount() > max_lines:
-            cursor = text_area.textCursor()
-            cursor.movePosition(QtGui.QTextCursor.MoveOperation.Start)
-            for _ in range(doc.blockCount() - max_lines):
-                cursor.select(QtGui.QTextCursor.SelectionType.LineUnderCursor)
-                cursor.removeSelectedText()
-                cursor.deleteChar()
-            text_area.setTextCursor(cursor)
-        if self.overlay_window and self.overlay_window.isVisible():
-            self.start_overlay_sync(text_area)
+        thread = QtCore.QThread()
+        worker = TranslationWorker(handler, lines)
+        worker.moveToThread(thread)
+
+        worker.finished.connect(lambda result: self.display_translations(text_area, result))
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        thread.started.connect(worker.run)
+        thread.start()
+
+        if not hasattr(handler, "active_threads"):
+            handler.active_threads = []
+        handler.active_threads.append((thread, worker))
+
+
 
     def apply_original_tag_colors(self):
-        # Keine separate Tag-Konfiguration nötig, da QTextCharFormat genutzt wird
         pass
 
     def close_selected_tab(self, idx=None):
@@ -599,20 +607,39 @@ class App(QtWidgets.QMainWindow):
             idx = self.tab_widget.currentIndex()
         if idx == -1 or idx >= len(self.handlers):
             return
+
         handler, text_area, timer, tab_idx = self.handlers[idx]
         handler.stop_event.set()
+
         if handler.file:
             handler.file.close()
         timer.stop()
+
+        if hasattr(handler, "active_threads"):
+            for thread, worker in handler.active_threads:
+                try:
+                    if hasattr(worker, "cancelled"):
+                        worker.cancelled = True  # Worker-Stop setzen
+
+                    if isinstance(thread, QtCore.QThread) and QtCore.QThread.isRunning(thread):
+                        thread.quit()
+                        thread.wait()
+                except RuntimeError:
+                    continue
+            handler.active_threads.clear()
+
+
+
         self.tab_widget.removeTab(idx)
         del self.handlers[idx]
+
 
     def check_for_updates(self):
         try:
             response = requests.get("https://api.github.com/repos/bravuralion/TD2-Chat-Translator/releases/latest")
             response.raise_for_status()
             latest_release = response.json()
-            latest_version = latest_release['tag_name']  # z.B. "0.2.8"
+            latest_version = latest_release['tag_name']
             if version.parse(latest_version) > version.parse(current_version):
                 reply = QtWidgets.QMessageBox.question(
                     self,
@@ -631,13 +658,13 @@ class App(QtWidgets.QMainWindow):
             if handler.file:
                 handler.file.close()
             timer.stop()
-        if self.overlay_window:
-            self.overlay_window.save_overlay_settings()  # Save before closing
-            self.overlay_window.close()
-        if hasattr(self, 'global_hotkey_listener') and self.global_hotkey_listener is not None:
-            self.global_hotkey_listener.stop()
-            self.global_hotkey_listener.join()
-        event.accept()
+
+            if hasattr(handler, "active_threads"):
+                for thread, worker in handler.active_threads:
+                    if isinstance(thread, QtCore.QThread) and thread.isRunning():
+                        thread.quit()
+                        thread.wait()
+                handler.active_threads.clear()
 
     def toggle_overlay(self):
         if self.overlay_window and self.overlay_window.isVisible():
@@ -654,11 +681,9 @@ class App(QtWidgets.QMainWindow):
 
     def start_overlay_sync(self, source_text_widget):
         def sync():
-            # Zeige nur die aktuell ausgewählte Tab-Übersetzung im Overlay
             if not self.overlay_window or not self.overlay_window.isVisible():
                 return
             current_tab = self.tab_widget.currentIndex()
-            # Prüfe, ob der source_text_widget noch der aktive Tab ist
             if current_tab != -1 and self.handlers[current_tab][1] is source_text_widget:
                 self.overlay_window.text_edit.setPlainText("")  # Clear first
                 src_cursor = source_text_widget.textCursor()
@@ -681,6 +706,43 @@ class App(QtWidgets.QMainWindow):
             return
         self.overlay_font_size = max(6, self.overlay_font_size + delta)
         self.overlay_window.change_font_size(delta)
+    def display_translations(self, text_area, translated_lines):
+        max_lines = 50
+        cursor = text_area.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+
+        for line, line_type in translated_lines:
+            fmt = QtGui.QTextCharFormat()
+            if line_type == "fahrdienstleiter":
+                fmt.setForeground(QtGui.QColor("#DF7676"))
+                fmt.setFontWeight(QtGui.QFont.Weight.Bold)
+            elif line_type == "translated":
+                fmt.setForeground(QtGui.QColor("orange"))
+                fmt.setFontWeight(QtGui.QFont.Weight.Bold)
+            elif line_type == "swdr":
+                fmt.setForeground(QtGui.QColor("green"))
+                fmt.setFontWeight(QtGui.QFont.Weight.Bold)
+            else:
+                fmt.setForeground(QtGui.QColor("white"))
+
+            cursor.insertText(line + "\n", fmt)
+            text_area.setTextCursor(cursor)
+        text_area.ensureCursorVisible()
+
+        doc = text_area.document()
+        if doc.blockCount() > max_lines:
+            cursor = text_area.textCursor()
+            cursor.movePosition(QtGui.QTextCursor.MoveOperation.Start)
+            for _ in range(doc.blockCount() - max_lines):
+                cursor.select(QtGui.QTextCursor.SelectionType.LineUnderCursor)
+                cursor.removeSelectedText()
+                cursor.deleteChar()
+            text_area.setTextCursor(cursor)
+
+        if self.overlay_window and self.overlay_window.isVisible():
+            self.start_overlay_sync(text_area)
+
+
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
     main_win = App()
