@@ -1,4 +1,5 @@
 from email.mime import text
+from math import dist
 import os
 import sys
 import re
@@ -20,7 +21,8 @@ import time
 from packaging import version
 from concurrent.futures import ThreadPoolExecutor, thread
 import json
-current_version = "0.3.5"
+from PyQt6.QtMultimedia import QSoundEffect
+current_version = "0.4.0"
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev und for PyInstaller """
@@ -71,8 +73,9 @@ def load_scenery_names(filepath):
 
 class LogHandler(QtCore.QObject):
     lines_translated = QtCore.pyqtSignal(list)
+    play_warning_sound = QtCore.pyqtSignal()
 
-    def __init__(self, log_file_path, language_var, service_var, ignore_list, fixed_translations, scenery_names):
+    def __init__(self, log_file_path, language_var, service_var, ignore_list, fixed_translations, scenery_names,enable_driver_warning):
         super().__init__()
         self.log_file_path = log_file_path
         self.file = open(log_file_path, 'r', encoding='utf-8')
@@ -86,6 +89,28 @@ class LogHandler(QtCore.QObject):
         self.last_position = self.file.tell()
         self.stop_event = Event()
         self.openai_client = OpenAI(api_key=config['DEFAULT']['OPENAI_API_KEY'])
+        self.warning_sound = QSoundEffect()
+        self.warning_sound.setSource(QtCore.QUrl.fromLocalFile(resource_path("res/timer_alarm.wav")))
+        self.warning_sound.setLoopCount(1)
+        self.warning_sound.setVolume(0.8)  # Lautstärke von 0.0 bis 1.0
+        self.play_warning_sound.connect(self.warning_sound.play)
+        self.warned_drivers = set()
+        self.enable_driver_warning = enable_driver_warning
+
+    def get_driver_distance(self, name):
+        try:
+            url = f"https://stacjownik.spythere.eu/api/getDriverInfo?name={name}"
+            resp = requests.get(url, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                dist = data.get("_sum", {}).get("currentDistance")
+                if isinstance(dist, (int, float)):
+                    return dist
+            # Wenn dist None, null, oder nicht vorhanden: Alarm auslösen per Rückgabe eines Markers
+            return None
+        except Exception:
+            return None
+
 
 
     @staticmethod
@@ -138,6 +163,30 @@ class LogHandler(QtCore.QObject):
                     continue
                 if message in self.ignore_list:
                     continue
+                driver_name = None
+                dist = None
+
+                username_match = re.search(r'@([^\s:]+)', timestamp_user)
+                if username_match:
+                    driver_name = username_match.group(1)
+                    if not hasattr(self, "_driver_cache"):
+                        self._driver_cache = {}
+
+                    if driver_name not in self._driver_cache:
+                        self._driver_cache[driver_name] = self.get_driver_distance(driver_name)
+
+                    dist = self._driver_cache.get(driver_name)
+
+                # --- NEU: Warnlogik nur mit Fahrername ---
+                if driver_name and self.enable_driver_warning():
+                    # Warnen bei unbekannter Distanz (None) ODER < 100, nur einmal pro Fahrer
+                    if (dist is None or (isinstance(dist, (int, float)) and dist < 100)) and driver_name not in self.warned_drivers:
+                        warning = f"ATTENTION: DRIVER {driver_name} drove less than 100 KM, be careful!"
+                        translated_lines.append((warning, "warning"))
+                        self.play_warning_sound.emit()
+                        self.warned_drivers.add(driver_name)
+
+
                 current_target_language = self.language_var() if callable(self.language_var) else self.language_var
                 translation_service = self.service_var() if callable(self.service_var) else self.service_var
                 self.target_language = current_target_language
@@ -161,7 +210,7 @@ class LogHandler(QtCore.QObject):
         ):
             return self.fixed_translations[text_lower][current_target_language]
 
-
+    
         masked_text, mask_map = self._mask_scenery_names(text)
 
         if translation_service == "ChatGPT":
@@ -170,7 +219,7 @@ class LogHandler(QtCore.QObject):
             translated = self.translate_with_google(masked_text)
         elif translation_service == "Deepl":
             translated = self.translate_with_deepl(masked_text)
-        else:
+        else:  
             translated = masked_text
 
 
@@ -374,7 +423,7 @@ class OverlayWindow(QtWidgets.QWidget):
 class App(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Train Driver 2 Translation Helper")
+        self.setWindowTitle("Train Driver 2 Translation Helper 0.4.0")
         self.overlay_window = None
         self.overlay_font_size = 10
 
@@ -389,6 +438,7 @@ class App(QtWidgets.QMainWindow):
         self.language_var = "English"
         self.service_var = "Deepl"
         self.is_dark_mode = True
+        self.enable_driver_warning = True 
 
         self.handlers = []
         self.opened_logs = set()
@@ -475,6 +525,11 @@ class App(QtWidgets.QMainWindow):
         aminus_btn = QtWidgets.QPushButton("A−")
         aminus_btn.clicked.connect(lambda: self.change_overlay_font_size(-1))
         frame3.addWidget(aminus_btn)
+        self.warning_checkbox = QtWidgets.QCheckBox("Driver Warnings")
+        self.warning_checkbox.setChecked(True)
+        self.warning_checkbox.stateChanged.connect(lambda state: setattr(self, "enable_driver_warning", state == QtCore.Qt.CheckState.Checked))
+        frame3.addWidget(self.warning_checkbox)
+
 
         main_layout.addLayout(frame3)
 
@@ -526,8 +581,10 @@ class App(QtWidgets.QMainWindow):
             service_var=lambda: self.service_var,
             ignore_list=self.ignore_list,
             fixed_translations=self.fixed_translations,
-            scenery_names=self.scenery_names
+            scenery_names=self.scenery_names,
+            enable_driver_warning=lambda: self.warning_checkbox.isChecked()
         )
+        handler.setParent(self)
         handler.lines_translated.connect(lambda lines: self.process_lines(handler, text_area, lines))
         handler.file.seek(0, os.SEEK_END)
         latest_message = None
@@ -585,17 +642,26 @@ class App(QtWidgets.QMainWindow):
         worker = TranslationWorker(handler, lines)
         worker.moveToThread(thread)
 
-        worker.finished.connect(lambda result: self.display_translations(text_area, result))
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        def on_finished(result):
+            self.display_translations(text_area, result)
+            thread.quit()
+            thread.wait()
+            thread.deleteLater()
+            worker.deleteLater()
+            # Entferne aus aktiven Threads
+            if hasattr(handler, "active_threads"):
+                handler.active_threads = [
+                    t for t in handler.active_threads if t[0] is not thread
+                ]
 
+        worker.finished.connect(on_finished)
         thread.started.connect(worker.run)
         thread.start()
 
         if not hasattr(handler, "active_threads"):
             handler.active_threads = []
         handler.active_threads.append((thread, worker))
+
 
 
 
@@ -666,6 +732,11 @@ class App(QtWidgets.QMainWindow):
                         thread.wait()
                 handler.active_threads.clear()
 
+        if self.overlay_window:
+            self.overlay_window.close()
+            self.overlay_window = None
+
+
     def toggle_overlay(self):
         if self.overlay_window and self.overlay_window.isVisible():
             self.overlay_window.close()
@@ -722,6 +793,9 @@ class App(QtWidgets.QMainWindow):
             elif line_type == "swdr":
                 fmt.setForeground(QtGui.QColor("green"))
                 fmt.setFontWeight(QtGui.QFont.Weight.Bold)
+            elif line_type == "warning":
+                fmt.setForeground(QtGui.QColor("red"))
+                fmt.setFontWeight(QtGui.QFont.Weight.Bold)
             else:
                 fmt.setForeground(QtGui.QColor("white"))
 
@@ -737,7 +811,9 @@ class App(QtWidgets.QMainWindow):
                 cursor.select(QtGui.QTextCursor.SelectionType.LineUnderCursor)
                 cursor.removeSelectedText()
                 cursor.deleteChar()
+            cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
             text_area.setTextCursor(cursor)
+            text_area.ensureCursorVisible()
 
         if self.overlay_window and self.overlay_window.isVisible():
             self.start_overlay_sync(text_area)

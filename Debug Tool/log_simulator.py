@@ -100,7 +100,7 @@ class LogSimulatorApp:
     bottom; once the end is reached the simulator stops.
     """
 
-    POLL_INTERVAL = 5.0  # seconds between messages
+    POLL_INTERVAL = 15.0  # seconds between messages
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
