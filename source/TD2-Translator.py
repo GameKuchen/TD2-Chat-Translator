@@ -22,7 +22,7 @@ from packaging import version
 from concurrent.futures import ThreadPoolExecutor, thread
 import json
 from PyQt6.QtMultimedia import QSoundEffect
-current_version = "0.4.0"
+current_version = "0.4.1"
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev und for PyInstaller """
@@ -356,7 +356,7 @@ class OverlayWindow(QtWidgets.QWidget):
         self.text_edit.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.text_edit.setFont(QtGui.QFont("Helvetica", self.font_size, QtGui.QFont.Weight.Bold))
         self.text_edit.setStyleSheet(
-            f"background-color: {'#3E3E3E' if dark_mode else '#FFFFFF'}; color: {'#FFFFFF' if dark_mode else '#000000'};"
+            f"background-color: {'#3E3E3E' if dark_mode else '#FFFFFF'};"  # keine 'color:' hier
         )
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -423,7 +423,7 @@ class OverlayWindow(QtWidgets.QWidget):
 class App(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Train Driver 2 Translation Helper 0.4.0")
+        self.setWindowTitle("Train Driver 2 Translation Helper 0.4.1")
         self.overlay_window = None
         self.overlay_font_size = 10
 
@@ -447,12 +447,13 @@ class App(QtWidgets.QMainWindow):
         self.known_logs = {}
         self.tab_widget = None
         self.init_ui()
-        QtCore.QTimer.singleShot(1000, self.check_for_updates)
         self.apply_theme()
         self.global_hotkey_listener = pynput_keyboard.Listener(on_press=self._on_global_key)
         self.global_hotkey_listener.start()
         f10_shortcut = QtGui.QShortcut(QtGui.QKeySequence("F10"), self)
         f10_shortcut.activated.connect(self.toggle_overlay)
+        self._overlay_sync_state = {}
+        self.start_update_check()
 
     def _on_global_key(self, key):
         try:
@@ -635,7 +636,7 @@ class App(QtWidgets.QMainWindow):
             QCheckBox {{ background-color: {bg_color}; color: {fg_color}; }}
         """)
 
-        self.apply_original_tag_colors()
+        
 
     def process_lines(self, handler, text_area, lines):
         thread = QtCore.QThread()
@@ -661,12 +662,6 @@ class App(QtWidgets.QMainWindow):
         if not hasattr(handler, "active_threads"):
             handler.active_threads = []
         handler.active_threads.append((thread, worker))
-
-
-
-
-    def apply_original_tag_colors(self):
-        pass
 
     def close_selected_tab(self, idx=None):
         if idx is None:
@@ -699,24 +694,40 @@ class App(QtWidgets.QMainWindow):
         self.tab_widget.removeTab(idx)
         del self.handlers[idx]
 
+    def start_update_check(self):
+        t = QtCore.QThread(self)
+        worker = QtCore.QObject()
+        t.started.connect(lambda: self._do_update_check(t))
+        t.start()
 
-    def check_for_updates(self):
+    def _do_update_check(self, thread):
         try:
-            response = requests.get("https://api.github.com/repos/bravuralion/TD2-Chat-Translator/releases/latest")
-            response.raise_for_status()
-            latest_release = response.json()
-            latest_version = latest_release['tag_name']
+            resp = requests.get(
+                "https://api.github.com/repos/bravuralion/TD2-Chat-Translator/releases/latest",
+                timeout=3  # hartes Timeout
+            )
+            resp.raise_for_status()
+            latest_release = resp.json()
+            latest_version = latest_release.get('tag_name', current_version)
             if version.parse(latest_version) > version.parse(current_version):
-                reply = QtWidgets.QMessageBox.question(
-                    self,
-                    "Update Available",
-                    f"A new version {latest_version} is available. Download?",
+                QtCore.QMetaObject.invokeMethod(
+                    self, "_prompt_update", QtCore.Qt.ConnectionType.QueuedConnection,
+                    QtCore.Q_ARG(str, latest_version),
+                    QtCore.Q_ARG(str, latest_release['assets'][0]['browser_download_url'])
                 )
-                if reply == QtWidgets.QMessageBox.StandardButton.Yes:
-                    download_url = latest_release['assets'][0]['browser_download_url']
-                    os.startfile(download_url)
-        except Exception as e:
-            print(f"Update check failed: {e}")
+        except Exception:
+            pass
+        finally:
+            thread.quit()
+            thread.wait()
+
+    @QtCore.pyqtSlot(str, str)
+    def _prompt_update(self, latest_version, download_url):
+        reply = QtWidgets.QMessageBox.question(
+            self, "Update Available",
+            f"A new version {latest_version} is available. Download?")
+        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+            os.startfile(download_url)
 
     def closeEvent(self, event):
         for handler, text_area, timer, tab_idx in self.handlers:
@@ -751,26 +762,26 @@ class App(QtWidgets.QMainWindow):
                 self.start_overlay_sync(text_area)
 
     def start_overlay_sync(self, source_text_widget):
-        def sync():
-            if not self.overlay_window or not self.overlay_window.isVisible():
-                return
-            current_tab = self.tab_widget.currentIndex()
-            if current_tab != -1 and self.handlers[current_tab][1] is source_text_widget:
-                self.overlay_window.text_edit.setPlainText("")  # Clear first
-                src_cursor = source_text_widget.textCursor()
-                src_cursor.movePosition(QtGui.QTextCursor.MoveOperation.Start)
-                while not src_cursor.atEnd():
-                    src_cursor.select(QtGui.QTextCursor.SelectionType.LineUnderCursor)
-                    line_text = src_cursor.selectedText()
-                    fmt = src_cursor.charFormat()
-                    overlay_cursor = self.overlay_window.text_edit.textCursor()
-                    overlay_cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
-                    overlay_cursor.insertText(line_text + "\n", fmt)
-                    self.overlay_window.text_edit.setTextCursor(overlay_cursor)
-                    src_cursor.movePosition(QtGui.QTextCursor.MoveOperation.Down)
-                self.overlay_window.text_edit.ensureCursorVisible()
-            QtCore.QTimer.singleShot(1000, lambda: self.start_overlay_sync(source_text_widget))
-        sync()
+        if not self.overlay_window or not self.overlay_window.isVisible():
+            return
+
+        # Initialen Full-Sync (formatiert) durchführen
+        src_cur = source_text_widget.textCursor()
+        src_cur.movePosition(QtGui.QTextCursor.MoveOperation.Start)
+        src_cur.movePosition(QtGui.QTextCursor.MoveOperation.End, QtGui.QTextCursor.MoveMode.KeepAnchor)
+        fragment = QtGui.QTextDocumentFragment(src_cur)
+
+        self.overlay_window.text_edit.clear()
+        ov_cur = self.overlay_window.text_edit.textCursor()
+        ov_cur.insertFragment(fragment)
+        self.overlay_window.text_edit.setTextCursor(ov_cur)
+        self.overlay_window.text_edit.ensureCursorVisible()
+
+        # Overlay-Status merken
+        self._overlay_sync_state[source_text_widget] = {
+            "last_blocks": source_text_widget.document().blockCount()
+        }
+
 
     def change_overlay_font_size(self, delta):
         if not self.overlay_window or not self.overlay_window.isVisible():
@@ -781,6 +792,7 @@ class App(QtWidgets.QMainWindow):
         max_lines = 50
         cursor = text_area.textCursor()
         cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+        insert_start = cursor.position()
 
         for line, line_type in translated_lines:
             fmt = QtGui.QTextCharFormat()
@@ -802,6 +814,20 @@ class App(QtWidgets.QMainWindow):
             cursor.insertText(line + "\n", fmt)
             text_area.setTextCursor(cursor)
         text_area.ensureCursorVisible()
+        if self.overlay_window and self.overlay_window.isVisible():
+            # nur den soeben eingefügten Bereich an das Overlay anhängen (mit Formatierung)
+            ins_cur = QtGui.QTextCursor(text_area.document())
+            ins_cur.setPosition(insert_start)
+            ins_cur.setPosition(cursor.position(), QtGui.QTextCursor.MoveMode.KeepAnchor)
+            fragment = QtGui.QTextDocumentFragment(ins_cur)
+
+            ov = self.overlay_window.text_edit
+            ov_cur = ov.textCursor()
+            ov_cur.movePosition(QtGui.QTextCursor.MoveOperation.End)
+            ov_cur.insertFragment(fragment)
+            ov.setTextCursor(ov_cur)
+            ov.ensureCursorVisible()
+
 
         doc = text_area.document()
         if doc.blockCount() > max_lines:
@@ -814,10 +840,8 @@ class App(QtWidgets.QMainWindow):
             cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
             text_area.setTextCursor(cursor)
             text_area.ensureCursorVisible()
-
-        if self.overlay_window and self.overlay_window.isVisible():
-            self.start_overlay_sync(text_area)
-
+            if self.overlay_window and self.overlay_window.isVisible():
+                self.start_overlay_sync(text_area)
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
