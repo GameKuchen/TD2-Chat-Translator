@@ -24,6 +24,21 @@ import json
 from PyQt6.QtMultimedia import QSoundEffect
 current_version = "0.4.1"
 
+
+class TranslationDisplay(QtWidgets.QTextEdit):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setAcceptRichText(False)
+
+    def keyPressEvent(self, event):
+        if event.matches(QtGui.QKeySequence.StandardKey.Copy):
+            cursor = self.textCursor()
+            if not cursor.hasSelection():
+                QtGui.QGuiApplication.clipboard().setText(self.toPlainText())
+                return
+        super().keyPressEvent(event)
+
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev und for PyInstaller """
     base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
@@ -336,6 +351,120 @@ class LogHandler(QtCore.QObject):
         }
         return language_codes.get(language, None)
 
+
+class ManualTranslator:
+    def __init__(self, language_var, service_var, fixed_translations, scenery_names):
+        self.language_var = language_var
+        self.service_var = service_var
+        self.fixed_translations = fixed_translations
+        self.scenery_names = scenery_names
+        self.translator = Translator()
+        self.deepl_translator = deepl.Translator(deepl_api_key)
+        self.openai_client = OpenAI(api_key=config['DEFAULT']['OPENAI_API_KEY'])
+        self.target_language = "English"
+
+    def translate(self, text):
+        self.target_language = self.language_var() if callable(self.language_var) else self.language_var
+        translation_service = self.service_var() if callable(self.service_var) else self.service_var
+        text_lower = text.lower()
+
+        if (
+            text_lower in self.fixed_translations
+            and self.target_language in self.fixed_translations[text_lower]
+        ):
+            return self.fixed_translations[text_lower][self.target_language]
+
+        masked_text, mask_map = self._mask_scenery_names(text)
+
+        if translation_service == "ChatGPT":
+            translated = self.translate_with_chatgpt(masked_text)
+        elif translation_service == "Google Translate":
+            translated = self.translate_with_google(masked_text)
+        elif translation_service == "Deepl":
+            translated = self.translate_with_deepl(masked_text)
+        else:
+            translated = masked_text
+
+        return self._unmask_scenery_names(translated, mask_map)
+
+    def _mask_scenery_names(self, text):
+        mask_map = {}
+        masked_text = text
+        for name in sorted(self.scenery_names, key=len, reverse=True):
+            pattern = r'\\b' + re.escape(name) + r'\\b'
+            mask = f"__SCENERY_{hash(name)}__"
+            if re.search(pattern, masked_text):
+                masked_text = re.sub(pattern, mask, masked_text)
+                mask_map[mask] = name
+        return masked_text, mask_map
+
+    def _unmask_scenery_names(self, text, mask_map):
+        for mask, name in mask_map.items():
+            text = text.replace(mask, name)
+        return text
+
+    def translate_with_chatgpt(self, text):
+        try:
+            thread = self.openai_client.beta.threads.create()
+            self.openai_client.beta.threads.messages.create(
+                thread_id=thread.id,
+                role="user",
+                content=(
+                    f"Translate the following Sentence to {self.target_language}. "
+                    f"Only provide the translation without any explanations or additional text. "
+                    f"If there are parts that cannot be translated (e.g., names, emojis), leave those unchanged: {text}"
+                )
+            )
+
+            run = self.openai_client.beta.threads.runs.create_and_poll(
+                thread_id=thread.id,
+                assistant_id="asst_dxWUY2bN5TSwZXi09Q7HKITj",
+                instructions=(
+                    "You are a translator. Translate the text to the requested language only. "
+                    "Do not explain anything. Keep names and symbols unchanged."
+                )
+            )
+
+            if run.status == 'completed':
+                messages = self.openai_client.beta.threads.messages.list(thread_id=thread.id)
+                message_data = messages.data
+                if message_data:
+                    for message in reversed(message_data):
+                        if message.role == "assistant" and message.content:
+                            return message.content[0].text.value.strip()
+                    return "No assistant message found"
+                return "No messages found"
+            else:
+                return f"Run not completed. Status: {run.status}"
+
+        except Exception as e:
+            return f"[ChatGPT Error] {str(e)}"
+
+    def translate_with_google(self, text):
+        try:
+            result = self.translator.translate(text, dest=self.target_language)
+            if hasattr(result, "__await__"):
+                import asyncio
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                result = loop.run_until_complete(result)
+            return result.text
+        except Exception as e:
+            return str(e)
+
+    def translate_with_deepl(self, text):
+        target_lang_code = LogHandler.get_deepl_language_code(self.target_language)
+        if not target_lang_code:
+            return f"Target language '{self.target_language}' not supported by Deepl"
+        try:
+            result = self.deepl_translator.translate_text(text, target_lang=target_lang_code)
+            return result.text
+        except Exception as e:
+            return str(e)
+
 class OverlayWindow(QtWidgets.QWidget):
     SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".td2_overlay_settings.json")
 
@@ -438,7 +567,14 @@ class App(QtWidgets.QMainWindow):
         self.language_var = "English"
         self.service_var = "Deepl"
         self.is_dark_mode = True
-        self.enable_driver_warning = True 
+        self.enable_driver_warning = True
+        self.manual_translator = ManualTranslator(
+            lambda: self.language_var,
+            lambda: self.service_var,
+            self.fixed_translations,
+            self.scenery_names
+        )
+        self.last_manual_translation = ""
 
         self.handlers = []
         self.opened_logs = set()
@@ -533,6 +669,25 @@ class App(QtWidgets.QMainWindow):
 
 
         main_layout.addLayout(frame3)
+
+        manual_group = QtWidgets.QGroupBox("Live Translation")
+        manual_layout = QtWidgets.QVBoxLayout(manual_group)
+        manual_input_layout = QtWidgets.QHBoxLayout()
+        manual_input_layout.addWidget(QtWidgets.QLabel("Type & press Enter:"))
+        self.manual_input = QtWidgets.QLineEdit()
+        self.manual_input.setPlaceholderText("Enter text to translate...")
+        self.manual_input.returnPressed.connect(self.handle_manual_translate)
+        self.manual_input.textChanged.connect(self.clear_manual_translation)
+        self.manual_input.installEventFilter(self)
+        manual_input_layout.addWidget(self.manual_input)
+        manual_layout.addLayout(manual_input_layout)
+
+        self.manual_translation_display = TranslationDisplay()
+        self.manual_translation_display.setPlaceholderText("Translation will appear here")
+        self.manual_translation_display.setFixedHeight(80)
+        self.manual_translation_display.installEventFilter(self)
+        manual_layout.addWidget(self.manual_translation_display)
+        main_layout.addWidget(manual_group)
 
         # Tabs
         self.tab_widget = QtWidgets.QTabWidget()
@@ -636,7 +791,36 @@ class App(QtWidgets.QMainWindow):
             QCheckBox {{ background-color: {bg_color}; color: {fg_color}; }}
         """)
 
-        
+    def handle_manual_translate(self):
+        text = self.manual_input.text().strip()
+        if not text:
+            self.clear_manual_translation()
+            return
+
+        translation = self.manual_translator.translate(text)
+        translation = re.sub(r'【[^】]*】', '', translation).strip()
+        self.last_manual_translation = translation
+        self.manual_translation_display.setPlainText(translation)
+
+    def clear_manual_translation(self):
+        self.last_manual_translation = ""
+        self.manual_translation_display.clear()
+
+    def eventFilter(self, obj, event):
+        if isinstance(event, QtGui.QKeyEvent) and event.type() == QtCore.QEvent.Type.KeyPress:
+            if event.matches(QtGui.QKeySequence.StandardKey.Copy):
+                has_selection = False
+                if isinstance(obj, QtWidgets.QLineEdit):
+                    has_selection = bool(obj.selectedText())
+                elif isinstance(obj, QtWidgets.QTextEdit):
+                    has_selection = obj.textCursor().hasSelection()
+
+                if not has_selection and self.last_manual_translation:
+                    QtGui.QGuiApplication.clipboard().setText(self.last_manual_translation)
+                    return True
+        return super().eventFilter(obj, event)
+
+
 
     def process_lines(self, handler, text_area, lines):
         thread = QtCore.QThread()
